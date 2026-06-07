@@ -80,6 +80,7 @@
     "mode_exec": "",
     "starting": "{mode_text}Starting cleanup of memory injection fragments in AstrBot historical messages...",
     "context_unavailable": "Cleanup failed: Unable to access AstrBot Context.\nPlease confirm the plugin is running in a full AstrBot context and retry.",
+    "core_busy": "Cleanup is temporarily unavailable: AstrBot conversation database is busy.\nPlease run /lmem cleanup again later; no historical data was modified.",
     "no_history": "Current session has no conversation history, no cleanup needed.",
     "empty_history": "Current conversation history is empty, no cleanup needed.",
     "parse_failed": "Failed to parse conversation history: data is not valid JSON.\nPlease check if session storage content was modified by external tools.",

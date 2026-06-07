@@ -531,7 +531,9 @@ except DatabaseError as e:
     "auto_remove_injected": true
   },
   "reflection_engine": {
-    "summary_trigger_rounds": 10
+    "summary_trigger_rounds": 10,
+    "quiet_delay_seconds": 30,
+    "max_concurrency": 1
   },
   "agent_tools": {
     "enable_recall_tool": true,

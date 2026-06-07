@@ -2,6 +2,7 @@
 Tests for ConversationManager behaviors.
 """
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -120,6 +121,41 @@ async def test_conversation_manager_range_and_metadata(tmp_path: Path):
 
     await manager.clear_session("test:private:s2")
     assert await store.get_message_count("test:private:s2") == 0
+
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_conversation_manager_concurrent_metadata_key_updates_preserve_values(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "metadata-concurrent.db"
+    store = ConversationStore(str(db_path))
+    await store.initialize()
+    manager = ConversationManager(store=store, max_cache_size=2, context_window_size=10)
+
+    session_id = "test:private:s-meta"
+    event = _DummyEvent(session_id, group=False)
+    await manager.add_message_from_event(event, role="user", content="hello")
+
+    await asyncio.gather(
+        manager.update_session_metadata(session_id, "last_summarized_index", 4),
+        manager.update_session_metadata(
+            session_id,
+            "pending_summary",
+            {"start_index": 2, "end_index": 4, "retry_count": 1},
+        ),
+    )
+
+    assert (
+        await manager.get_session_metadata(
+            session_id, "last_summarized_index", default=0
+        )
+        == 4
+    )
+    assert await manager.get_session_metadata(
+        session_id, "pending_summary", default=None
+    ) == {"start_index": 2, "end_index": 4, "retry_count": 1}
 
     await store.close()
 

@@ -220,6 +220,18 @@
                 "hint": "累计对话达到该轮次（一问一答为一轮）后触发总结并写入记忆。",
                 "type": "int",
                 "default": 10
+            },
+            "quiet_delay_seconds": {
+                "description": "总结前安静等待（秒）",
+                "hint": "达到总结轮次后，等待同一会话停止回复一段时间再执行记忆总结。默认 30 秒，可减少与 AstrBot 对话历史写入同时抢 SQLite 的情况。设为 0 表示立即总结。",
+                "type": "float",
+                "default": 30
+            },
+            "max_concurrency": {
+                "description": "总结并发上限",
+                "hint": "自动记忆总结同时执行的最大任务数。默认 1，较稳妥；调高会加快多会话处理，但也会增加数据库和模型请求压力。",
+                "type": "int",
+                "default": 1
             }
         }
     },

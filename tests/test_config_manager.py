@@ -20,6 +20,8 @@ def test_config_manager_loads_defaults() -> None:
     assert manager.get("session_manager.max_sessions") == 100
     assert manager.get("session_manager.max_messages_per_session") == 1000
     assert manager.get("session_manager.cleanup_batch_size") == 50
+    assert manager.get("reflection_engine.quiet_delay_seconds") == 30.0
+    assert manager.get("reflection_engine.max_concurrency") == 1
     assert manager.get("reflection_engine.save_original_conversation") is None
 
 
@@ -57,12 +59,18 @@ def test_validate_config_accepts_merged_model_shape() -> None:
     config = validate_config(
         {
             "recall_engine": {"top_k": 8},
-            "reflection_engine": {"summary_trigger_rounds": 4},
+            "reflection_engine": {
+                "summary_trigger_rounds": 4,
+                "quiet_delay_seconds": 12.5,
+                "max_concurrency": 2,
+            },
         }
     )
 
     assert config.recall_engine.top_k == 8
     assert config.reflection_engine.summary_trigger_rounds == 4
+    assert config.reflection_engine.quiet_delay_seconds == 12.5
+    assert config.reflection_engine.max_concurrency == 2
 
 
 def test_config_manager_graph_memory_property() -> None:

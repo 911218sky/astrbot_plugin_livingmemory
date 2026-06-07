@@ -11,7 +11,6 @@
 """
 
 import asyncio
-import json
 import time
 from collections import OrderedDict
 from typing import Any
@@ -675,30 +674,12 @@ class ConversationManager:
             key: 元数据键
             value: 元数据值
         """
-        session = await self.store.get_session(session_id)
-        if not session:
+        saved = await self.store.update_session_metadata_key(session_id, key, value)
+        if not saved:
             logger.warning(
                 f"[ConversationManager] 会话 {session_id} 不存在，无法更新元数据"
             )
             return
-
-        # 更新元数据
-        session.metadata[key] = value
-
-        # 保存到数据库
-        if self.store.connection is not None:
-            try:
-                await self.store.connection.execute(
-                    """
-                    UPDATE sessions
-                    SET metadata = ?
-                    WHERE session_id = ?
-                """,
-                    (json.dumps(session.metadata, ensure_ascii=False), session_id),
-                )
-                await self.store.connection.commit()
-            except Exception as e:
-                logger.error(f"更新会话元数据失败: {e}", exc_info=True)
 
         logger.debug(
             f"[ConversationManager] 更新会话元数据: {session_id}, {key}={value}"
@@ -737,20 +718,10 @@ class ConversationManager:
             return
         # 将元数据重置为空字典
         session.metadata = {}
-        # 保存回数据库
-        if self.store.connection is not None:
-            try:
-                await self.store.connection.execute(
-                    """
-                    UPDATE sessions
-                    SET metadata = ?
-                    WHERE session_id = ?
-                """,
-                    ("{}", session_id),
-                )
-                await self.store.connection.commit()
-            except Exception as e:
-                logger.error(f"重置会话元数据失败: {e}", exc_info=True)
+        # 保存回数据库。写入统一走 ConversationStore 的写锁，避免并发提交。
+        saved = await self.store.replace_session_metadata(session_id, {})
+        if not saved:
+            logger.error(f"重置会话元数据失败: {session_id}")
         logger.info(
             f"[ConversationManager] 已重置会话 {session_id} 的元数据 (记忆总结计数器已清零)"
         )

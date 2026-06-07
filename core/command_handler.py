@@ -14,6 +14,7 @@ from .base.config_manager import ConfigManager
 from .i18n_backend import t, t_list
 from .managers.conversation_manager import ConversationManager
 from .managers.memory_engine import MemoryEngine
+from .utils import CoreConversationBusy, _retry_core_conversation_call
 from .validators.index_validator import IndexValidator
 
 
@@ -503,18 +504,26 @@ class CommandHandler:
             if not self.context:
                 yield event.plain_result(t("cleanup.context_unavailable"))
                 return
+            core_conversation_manager = getattr(self.context, "conversation_manager", None)
+            if not core_conversation_manager:
+                yield event.plain_result(t("cleanup.context_unavailable"))
+                return
 
             # 获取当前对话 ID
-            cid = await self.context.conversation_manager.get_curr_conversation_id(
-                session_id
+            cid = await _retry_core_conversation_call(
+                "cleanup.get_curr_conversation_id",
+                session_id,
+                lambda: core_conversation_manager.get_curr_conversation_id(session_id),
             )
             if not cid:
                 yield event.plain_result(t("cleanup.no_history"))
                 return
 
             # 获取对话历史
-            conversation = await self.context.conversation_manager.get_conversation(
-                session_id, cid
+            conversation = await _retry_core_conversation_call(
+                "cleanup.get_conversation",
+                session_id,
+                lambda: core_conversation_manager.get_conversation(session_id, cid),
             )
             if not conversation or not conversation.history:
                 yield event.plain_result(t("cleanup.empty_history"))
@@ -592,10 +601,14 @@ class CommandHandler:
 
             # 如果不是预演模式，更新数据库
             if not dry_run and (stats["cleaned"] > 0 or stats["deleted"] > 0):
-                await self.context.conversation_manager.update_conversation(
-                    unified_msg_origin=session_id,
-                    conversation_id=cid,
-                    history=cleaned_history,
+                await _retry_core_conversation_call(
+                    "cleanup.update_conversation",
+                    session_id,
+                    lambda: core_conversation_manager.update_conversation(
+                        unified_msg_origin=session_id,
+                        conversation_id=cid,
+                        history=cleaned_history,
+                    ),
                 )
                 logger.info(
                     f"[{session_id}] cleanup 已更新 AstrBot 对话历史: "
@@ -618,6 +631,9 @@ class CommandHandler:
 
             yield event.plain_result(message)
 
+        except CoreConversationBusy as e:
+            logger.warning(f"[{session_id}] 清理历史消息时 AstrBot 对话库忙碌: {e}")
+            yield event.plain_result(t("cleanup.core_busy"))
         except Exception as e:
             logger.error(f"清理历史消息失败: {e}", exc_info=True)
             yield event.plain_result(

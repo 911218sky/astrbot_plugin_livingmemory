@@ -2,6 +2,7 @@
 Integration-style workflow tests with mocked dependencies.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -18,7 +19,7 @@ def setup_bundle():
     config_manager = ConfigManager(
         {
             "recall_engine": {"top_k": 3},
-            "reflection_engine": {"summary_trigger_rounds": 1},
+            "reflection_engine": {"summary_trigger_rounds": 1, "quiet_delay_seconds": 0},
         }
     )
 
@@ -104,6 +105,12 @@ def _make_event():
     return event
 
 
+async def _wait_for_storage_tasks(event_handler: EventHandler):
+    tasks = list(event_handler._storage_tasks)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_recall_reflection_and_search_workflow(setup_bundle):
     event_handler, command_handler, memory_engine, conversation_manager = setup_bundle
@@ -131,7 +138,7 @@ async def test_recall_reflection_and_search_workflow(setup_bundle):
     ) as get_persona:
         get_persona.return_value = "persona_a"
         await event_handler.handle_memory_reflection(event, resp)
-        await event_handler.shutdown()
+        await _wait_for_storage_tasks(event_handler)
 
     assert memory_engine.add_memory.await_count >= 1
 

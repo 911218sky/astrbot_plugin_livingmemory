@@ -80,6 +80,7 @@
     "mode_exec": "",
     "starting": "{mode_text}开始清理 AstrBot 历史消息中的记忆注入片段...",
     "context_unavailable": "清理失败：无法访问 AstrBot Context。\n请确认插件运行在完整 AstrBot 上下文中后重试。",
+    "core_busy": "清理暂时无法执行：AstrBot 对话数据库正在忙碌。\n请稍后再执行 /lmem cleanup；本次未修改任何历史数据。",
     "no_history": "当前会话没有对话历史，无需清理。",
     "empty_history": "当前对话历史为空，无需清理。",
     "parse_failed": "解析对话历史失败：数据不是有效 JSON。\n请检查会话存储内容是否被外部工具修改。",

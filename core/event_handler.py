@@ -75,8 +75,20 @@ class EventHandler:
         self._storage_tasks: set[asyncio.Task] = set()
         self._storage_sessions_inflight: set[str] = set()
         self._storage_state_lock = asyncio.Lock()
+        self._reflection_semaphore = asyncio.Semaphore(
+            self._get_reflection_max_concurrency()
+        )
+        self._last_response_times: dict[str, float] = {}
+        self._last_activity_times: dict[str, float] = {}
         self._shutting_down = False
         self._injection_adapter = InjectionAdapter()
+
+    def _should_stop_storage(self, session_id: str, stage: str) -> bool:
+        """Return True when shutdown should stop the current reflection task."""
+        if not self._shutting_down:
+            return False
+        logger.info(f"[{session_id}] 插件正在关闭，停止记忆反思（{stage}）")
+        return True
 
     async def handle_all_group_messages(self, event: AstrMessageEvent):
         """Capture all group messages for memory storage"""
@@ -97,6 +109,7 @@ class EventHandler:
 
         try:
             session_id = event.unified_msg_origin
+            self._mark_session_activity(session_id)
 
             # 检测异常session_id
             if session_id and (
@@ -186,6 +199,7 @@ class EventHandler:
                 # 存储用户消息（仅私聊），无论是否启用召回都需要
                 is_group = event.get_message_type() == MessageType.GROUP_MESSAGE
                 if not is_group and actual_query:
+                    self._mark_session_activity(session_id)
                     message_to_store = request_query
                     if not message_to_store:
                         message_to_store = await self._extract_message_content(
@@ -419,6 +433,8 @@ class EventHandler:
             if not response_text or not response_text.strip():
                 logger.debug(f"[{session_id}] 模型返回空回复，跳过记录")
                 return
+            self._last_response_times[session_id] = time.time()
+            self._mark_session_activity(session_id, self._last_response_times[session_id])
 
             # 检查是否为错误响应
             error_indicators = [
@@ -568,17 +584,6 @@ class EventHandler:
                     f"本次总结 {rounds_to_summarize} 轮"
                 )
 
-                # 获取需要总结的消息
-                history_messages = await self.conversation_manager.get_messages_range(
-                    session_id=session_id, start_index=start_index, end_index=end_index
-                )
-
-                logger.info(
-                    f"[{session_id}] 获取到 {len(history_messages)} 条消息用于总结"
-                )
-
-                persona_id = await get_persona_id(self.context, event)
-
                 # 创建后台任务进行存储（跟踪任务）
                 if not self._shutting_down:
                     async with self._storage_state_lock:
@@ -591,13 +596,13 @@ class EventHandler:
 
                     try:
                         task = asyncio.create_task(
-                            self._storage_task(
+                            self._delayed_storage_task(
                                 session_id,
-                                history_messages,
-                                persona_id,
+                                event,
                                 start_index,
                                 end_index,
                                 retry_count,
+                                self._last_activity_times.get(session_id, time.time()),
                             )
                         )
                     except Exception:
@@ -630,6 +635,199 @@ class EventHandler:
         if exc:
             logger.error(f"[{session_id}] 记忆存储任务异常退出: {exc}")
 
+    def _get_reflection_quiet_seconds(self) -> float:
+        """自动反思前等待的安静时间，避免与当前对话写入竞争。"""
+        raw_value = self.config_manager.get("reflection_engine.quiet_delay_seconds", 30)
+        try:
+            seconds = float(raw_value)
+        except (TypeError, ValueError):
+            seconds = 30.0
+        return min(max(seconds, 0.0), 600.0)
+
+    def _get_reflection_max_concurrency(self) -> int:
+        """自动反思全局并发数。默认 1，避免多个会话同时处理。"""
+        raw_value = self.config_manager.get("reflection_engine.max_concurrency", 1)
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            value = 1
+        return min(max(value, 1), 8)
+
+    def _mark_session_activity(self, session_id: str | None, at: float | None = None) -> None:
+        """记录同一会话的最新活动时间，用于延后自动反思。"""
+        if not session_id:
+            return
+        self._last_activity_times[session_id] = at if at is not None else time.time()
+
+    async def _wait_until_reflection_quiet(
+        self, session_id: str, observed_activity_time: float
+    ) -> None:
+        """等待同一会话安静；等待期间若又有消息或回复，则重新计算等待时间。"""
+        quiet_seconds = self._get_reflection_quiet_seconds()
+        if quiet_seconds <= 0:
+            return
+
+        logger.info(
+            f"[{session_id}] 记忆反思将在会话安静 {quiet_seconds:.0f} 秒后执行，"
+            "降低对话写入竞争"
+        )
+        while not self._shutting_down:
+            latest_activity_time = self._last_activity_times.get(
+                session_id, observed_activity_time
+            )
+            elapsed = time.time() - latest_activity_time
+            remaining = quiet_seconds - elapsed
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, 1.0))
+
+    async def _refresh_summary_window(
+        self,
+        session_id: str,
+        start_index: int,
+        end_index: int,
+    ) -> tuple[list, int, int] | None:
+        """反思真正执行前重新读取窗口，覆盖安静等待期间新增的消息。"""
+        if not self.conversation_manager:
+            return None
+
+        current_summarized = await self.conversation_manager.get_session_metadata(
+            session_id, "last_summarized_index", 0
+        )
+        pending_summary = await self.conversation_manager.get_session_metadata(
+            session_id, "pending_summary", None
+        )
+        try:
+            summarized_index = int(current_summarized)
+        except (TypeError, ValueError):
+            summarized_index = 0
+
+        pending_start_index = None
+        if isinstance(pending_summary, dict) and "start_index" in pending_summary:
+            try:
+                pending_start_index = int(pending_summary["start_index"])
+            except (TypeError, ValueError):
+                pending_start_index = None
+
+        if pending_start_index is not None:
+            start_index = pending_start_index
+        elif summarized_index > start_index:
+            start_index = summarized_index
+
+        try:
+            latest_count = await self.conversation_manager.store.get_message_count(
+                session_id
+            )
+        except Exception:
+            latest_count = end_index
+
+        end_index = max(end_index, latest_count)
+        if end_index - start_index < 2:
+            logger.debug(f"[{session_id}] 安静期后消息数不足一轮，跳过反思")
+            return None
+
+        history_messages = await self.conversation_manager.get_messages_range(
+            session_id=session_id,
+            start_index=start_index,
+            end_index=end_index,
+        )
+        if not history_messages:
+            logger.debug(f"[{session_id}] 安静期后未读取到可总结消息，跳过反思")
+            return None
+        return history_messages, start_index, end_index
+
+    async def _delayed_storage_task(
+        self,
+        session_id: str,
+        event: AstrMessageEvent,
+        start_index: int,
+        end_index: int,
+        retry_count: int,
+        observed_activity_time: float,
+    ) -> None:
+        """延迟并限流执行自动记忆反思。"""
+        while True:
+            await self._wait_until_reflection_quiet(session_id, observed_activity_time)
+            if self._shutting_down:
+                return
+
+            async with self._reflection_semaphore:
+                if self._shutting_down:
+                    return
+                refreshed = await self._refresh_summary_window(
+                    session_id, start_index, end_index
+                )
+                if refreshed is None:
+                    return
+                history_messages, start_index, end_index = refreshed
+                if self._should_stop_storage(session_id, "人格读取前"):
+                    return
+
+                try:
+                    persona_id = await get_persona_id(self.context, event)
+                except Exception as e:
+                    logger.warning(
+                        f"[{session_id}] 获取人格失败，改用未指定人格继续反思: {e}"
+                    )
+                    persona_id = None
+                success = await self._storage_task(
+                    session_id,
+                    history_messages,
+                    persona_id,
+                    start_index,
+                    end_index,
+                    retry_count,
+                )
+
+            if not success:
+                return
+            if self._shutting_down:
+                return
+
+            followup = await self._get_followup_summary_window(session_id, end_index)
+            if followup is None:
+                return
+            start_index, end_index, retry_count = followup
+            observed_activity_time = self._last_activity_times.get(
+                session_id, time.time()
+            )
+            logger.info(
+                f"[{session_id}] 检测到反思执行期间又累积到可总结消息，"
+                f"继续处理范围 [{start_index}:{end_index}]"
+            )
+
+    async def _get_followup_summary_window(
+        self, session_id: str, completed_end_index: int
+    ) -> tuple[int, int, int] | None:
+        """当前反思完成后，检查执行期间新增消息是否已达到下一轮总结门槛。"""
+        if not self.conversation_manager:
+            return None
+
+        try:
+            latest_count = await self.conversation_manager.store.get_message_count(
+                session_id
+            )
+            current_summarized = await self.conversation_manager.get_session_metadata(
+                session_id, "last_summarized_index", completed_end_index
+            )
+        except Exception as e:
+            logger.debug(f"[{session_id}] 检查后续反思窗口失败: {e}")
+            return None
+
+        try:
+            summarized_index = int(current_summarized)
+        except (TypeError, ValueError):
+            summarized_index = completed_end_index
+
+        start_index = max(summarized_index, completed_end_index)
+        trigger_rounds = self.config_manager.get(
+            "reflection_engine.summary_trigger_rounds", 10
+        )
+        unsummarized_rounds = (latest_count - start_index) // 2
+        if unsummarized_rounds < trigger_rounds:
+            return None
+        return start_index, latest_count, 0
+
     async def _storage_task(
         self,
         session_id: str,
@@ -638,7 +836,7 @@ class EventHandler:
         start_index: int,
         end_index: int,
         retry_count: int = 0,
-    ):
+    ) -> bool:
         """
         后台存储任务
 
@@ -652,6 +850,9 @@ class EventHandler:
         """
         async with OperationContext("记忆存储", session_id):
             try:
+                if self._should_stop_storage(session_id, "任务开始"):
+                    return False
+
                 # 如果其他任务已经推进了总结进度，本任务可能已过期，直接跳过
                 current_summarized = (
                     await self.conversation_manager.get_session_metadata(
@@ -668,7 +869,10 @@ class EventHandler:
                         f"[{session_id}] 检测到过期总结任务，跳过: "
                         f"current={summarized_index}, target_end={end_index}"
                     )
-                    return
+                    return True
+
+                if self._should_stop_storage(session_id, "LLM处理前"):
+                    return False
 
                 # 判断是否为群聊
                 is_group_chat = bool(
@@ -690,9 +894,11 @@ class EventHandler:
                     await self._record_pending_summary(
                         session_id, start_index, end_index, retry_count
                     )
-                    return
+                    return False
 
                 try:
+                    if self._should_stop_storage(session_id, "LLM调用前"):
+                        return False
                     logger.info(
                         f"[{session_id}] 调用 MemoryProcessor 处理 {len(history_messages)} 条消息"
                     )
@@ -733,10 +939,15 @@ class EventHandler:
                         f"[{session_id}] LLM处理失败 (重试 {retry_count + 1}/3): {e}",
                         exc_info=True,
                     )
+                    if self._should_stop_storage(session_id, "LLM失败后"):
+                        return False
                     await self._record_pending_summary(
                         session_id, start_index, end_index, retry_count
                     )
-                    return
+                    return False
+
+                if self._should_stop_storage(session_id, "记忆写入前"):
+                    return False
 
                 # 正常流程：添加到记忆引擎
                 if self.memory_engine:
@@ -755,6 +966,8 @@ class EventHandler:
 
                 # 成功：更新已总结的位置，清除待处理记录
                 if self.conversation_manager:
+                    if self._should_stop_storage(session_id, "元数据更新前"):
+                        return False
                     try:
                         await self.conversation_manager.update_session_metadata(
                             session_id, "last_summarized_index", end_index
@@ -773,6 +986,8 @@ class EventHandler:
                         )
                         # Advance the index anyway to prevent re-processing the
                         # same message range (memory is already stored durably).
+                        if self._should_stop_storage(session_id, "元数据重试前"):
+                            return False
                         try:
                             await self.conversation_manager.update_session_metadata(
                                 session_id, "last_summarized_index", end_index
@@ -786,12 +1001,18 @@ class EventHandler:
                                 "可能出现重复总结。",
                                 exc_info=True,
                             )
+                            return False
+
+                return True
 
             except Exception as e:
                 logger.error(f"[{session_id}] 存储记忆失败: {e}", exc_info=True)
+                if self._should_stop_storage(session_id, "异常处理"):
+                    return False
                 await self._record_pending_summary(
                     session_id, start_index, end_index, retry_count
                 )
+                return False
 
     async def _record_pending_summary(
         self,
@@ -810,6 +1031,8 @@ class EventHandler:
             current_retry_count: 当前重试次数
         """
         if not self.conversation_manager:
+            return
+        if self._should_stop_storage(session_id, "待重试记录前"):
             return
 
         new_retry_count = current_retry_count + 1
@@ -1317,8 +1540,14 @@ class EventHandler:
         """关闭事件处理器，等待所有存储任务完成"""
         self._shutting_down = True
         if self._storage_tasks:
-            logger.info(f"等待 {len(self._storage_tasks)} 个存储任务完成...")
-            await asyncio.gather(*self._storage_tasks, return_exceptions=True)
+            tasks = list(self._storage_tasks)
+            logger.info(f"等待 {len(tasks)} 个存储任务完成...")
+            _, pending = await asyncio.wait(tasks, timeout=5)
+            if pending:
+                logger.info(f"取消 {len(pending)} 个尚未完成的存储任务")
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
             self._storage_tasks.clear()
         self._storage_sessions_inflight.clear()
         logger.info("EventHandler 已关闭")

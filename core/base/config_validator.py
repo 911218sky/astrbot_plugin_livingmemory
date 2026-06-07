@@ -94,6 +94,18 @@ class ReflectionEngineConfig(BaseModel):
     summary_trigger_rounds: int = Field(
         default=10, ge=1, le=100, description="触发反思的对话轮次"
     )
+    quiet_delay_seconds: float = Field(
+        default=30.0,
+        ge=0.0,
+        le=600.0,
+        description="自动反思前等待同一会话安静的秒数",
+    )
+    max_concurrency: int = Field(
+        default=1,
+        ge=1,
+        le=8,
+        description="自动反思任务的全局并发上限",
+    )
 
 
 class AgentToolsConfig(BaseModel):

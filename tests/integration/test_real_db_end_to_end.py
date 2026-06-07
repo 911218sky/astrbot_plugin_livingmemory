@@ -2,6 +2,7 @@
 End-to-end integration tests with real plugin components and real SQLite/FAISS storage.
 """
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -101,6 +102,12 @@ class _DeterministicLLMProvider:
             "importance": importance,
         }
         return LLMResponse(role="assistant", completion_text=json.dumps(payload))
+
+
+async def _wait_for_storage_tasks(event_handler: EventHandler):
+    tasks = list(event_handler._storage_tasks)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class _ContextConversationManager:
@@ -219,7 +226,7 @@ async def real_db_stack(tmp_path: Path):
     config_manager = ConfigManager(
         {
             "recall_engine": {"top_k": 5, "injection_method": "extra_user_content"},
-            "reflection_engine": {"summary_trigger_rounds": 1},
+            "reflection_engine": {"summary_trigger_rounds": 1, "quiet_delay_seconds": 0},
             "session_manager": {"max_messages_per_session": 100},
         }
     )
@@ -327,7 +334,7 @@ async def test_normal_message_pipeline_with_real_database(real_db_stack):
 
     await event_handler.handle_memory_recall(event, req)
     await event_handler.handle_memory_reflection(event, resp)
-    await event_handler.shutdown()
+    await _wait_for_storage_tasks(event_handler)
 
     assert await conversation_manager.store.get_message_count(session_id) == 2
 

@@ -2,6 +2,8 @@
 Tests for EventHandler core behaviors.
 """
 
+import asyncio
+import time
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -63,7 +65,7 @@ def handler(memory_engine, memory_processor, conversation_manager):
         config_manager=ConfigManager(
             {
                 "recall_engine": {"top_k": 3, "injection_method": "extra_user_content"},
-                "reflection_engine": {"summary_trigger_rounds": 1},
+                "reflection_engine": {"summary_trigger_rounds": 1, "quiet_delay_seconds": 0},
                 "session_manager": {"max_messages_per_session": 100},
             }
         ),
@@ -104,6 +106,12 @@ def _make_event(group: bool = False):
     event.get_messages = Mock(return_value=[])
     event.get_platform_name = Mock(return_value="test")
     return event
+
+
+async def _wait_for_storage_tasks(handler: EventHandler):
+    tasks = list(handler._storage_tasks)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -169,10 +177,197 @@ async def test_handle_memory_reflection_triggers_storage_task(
         get_persona.return_value = "persona_1"
         await handler.handle_memory_reflection(event, resp)
         # Wait for background storage task.
-        await handler.shutdown()
+        await _wait_for_storage_tasks(handler)
 
     assert conversation_manager.get_messages_range.await_count >= 1
     assert memory_engine.add_memory.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_delayed_storage_task_catches_up_messages_added_while_running(
+    handler, conversation_manager, memory_engine
+):
+    """反思执行期间若又累积到触发轮数，应在同一后台任务内续跑下一段。"""
+    metadata = {"last_summarized_index": 0, "pending_summary": None}
+
+    async def _get_session_metadata(session_id, key, default=None):
+        return metadata.get(key, default)
+
+    async def _update_session_metadata(session_id, key, value):
+        metadata[key] = value
+
+    async def _get_messages_range(session_id, start_index, end_index):
+        return [Mock(group_id=None) for _ in range(end_index - start_index)]
+
+    conversation_manager.get_session_metadata = AsyncMock(
+        side_effect=_get_session_metadata
+    )
+    conversation_manager.update_session_metadata = AsyncMock(
+        side_effect=_update_session_metadata
+    )
+    conversation_manager.store.get_message_count = AsyncMock(
+        side_effect=[4, 6, 6, 6]
+    )
+    conversation_manager.get_messages_range = AsyncMock(
+        side_effect=_get_messages_range
+    )
+
+    with patch(
+        "astrbot_plugin_livingmemory.core.event_handler.get_persona_id",
+        new_callable=AsyncMock,
+    ) as get_persona:
+        get_persona.return_value = "persona_1"
+        await handler._delayed_storage_task(
+            "test:private:sid-1",
+            _make_event(group=False),
+            start_index=0,
+            end_index=2,
+            retry_count=0,
+            observed_activity_time=0,
+        )
+
+    assert memory_engine.add_memory.await_count == 2
+    range_calls = conversation_manager.get_messages_range.await_args_list
+    assert range_calls[0].kwargs["start_index"] == 0
+    assert range_calls[0].kwargs["end_index"] == 4
+    assert range_calls[1].kwargs["start_index"] == 4
+    assert range_calls[1].kwargs["end_index"] == 6
+    assert metadata["last_summarized_index"] == 6
+
+
+@pytest.mark.asyncio
+async def test_wait_until_reflection_quiet_extends_after_new_activity(
+    memory_engine, memory_processor, conversation_manager
+):
+    h = EventHandler(
+        context=Mock(),
+        config_manager=ConfigManager(
+            {
+                "recall_engine": {"top_k": 3, "injection_method": "extra_user_content"},
+                "reflection_engine": {
+                    "summary_trigger_rounds": 1,
+                    "quiet_delay_seconds": 0.08,
+                },
+                "session_manager": {"max_messages_per_session": 100},
+            }
+        ),
+        memory_engine=memory_engine,
+        memory_processor=memory_processor,
+        conversation_manager=conversation_manager,
+    )
+
+    session_id = "test:private:sid-quiet"
+    start = time.monotonic()
+    observed = time.time()
+    h._mark_session_activity(session_id, observed)
+    wait_task = asyncio.create_task(
+        h._wait_until_reflection_quiet(session_id, observed)
+    )
+
+    await asyncio.sleep(0.04)
+    h._mark_session_activity(session_id)
+    await asyncio.sleep(0.055)
+
+    assert not wait_task.done()
+    await wait_task
+    assert time.monotonic() - start >= 0.11
+
+
+@pytest.mark.asyncio
+async def test_delayed_storage_task_skips_database_work_when_shutting_down(
+    handler, conversation_manager
+):
+    handler._shutting_down = True
+
+    await handler._delayed_storage_task(
+        "test:private:sid-1",
+        _make_event(group=False),
+        start_index=0,
+        end_index=2,
+        retry_count=0,
+        observed_activity_time=0,
+    )
+
+    conversation_manager.store.get_message_count.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delayed_storage_task_stops_before_persona_when_shutdown_after_refresh(
+    handler,
+):
+    async def _refresh_and_start_shutdown(session_id, start_index, end_index):
+        handler._shutting_down = True
+        return [Mock(group_id=None), Mock(group_id=None)], start_index, end_index
+
+    handler._refresh_summary_window = AsyncMock(
+        side_effect=_refresh_and_start_shutdown
+    )
+    handler._storage_task = AsyncMock()
+
+    with patch(
+        "astrbot_plugin_livingmemory.core.event_handler.get_persona_id",
+        new_callable=AsyncMock,
+    ) as get_persona:
+        await handler._delayed_storage_task(
+            "test:private:sid-1",
+            _make_event(group=False),
+            start_index=0,
+            end_index=2,
+            retry_count=0,
+            observed_activity_time=0,
+        )
+
+    get_persona.assert_not_awaited()
+    handler._storage_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_storage_task_skips_all_work_when_shutdown_already_started(
+    handler, conversation_manager, memory_processor, memory_engine
+):
+    handler._shutting_down = True
+
+    success = await handler._storage_task(
+        "test:private:sid-1",
+        history_messages=[Mock(group_id=None)],
+        persona_id=None,
+        start_index=0,
+        end_index=2,
+        retry_count=0,
+    )
+
+    assert success is False
+    conversation_manager.get_session_metadata.assert_not_awaited()
+    conversation_manager.update_session_metadata.assert_not_awaited()
+    memory_processor.process_conversation.assert_not_awaited()
+    memory_engine.add_memory.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_storage_task_stops_before_memory_write_when_shutdown_starts_after_llm(
+    handler, conversation_manager, memory_processor, memory_engine
+):
+    async def _process_and_start_shutdown(**kwargs):
+        handler._shutting_down = True
+        return "summary", {"topics": ["t1"]}, 0.6
+
+    memory_processor.process_conversation = AsyncMock(
+        side_effect=_process_and_start_shutdown
+    )
+
+    success = await handler._storage_task(
+        "test:private:sid-1",
+        history_messages=[Mock(group_id=None), Mock(group_id=None)],
+        persona_id=None,
+        start_index=0,
+        end_index=2,
+        retry_count=0,
+    )
+
+    assert success is False
+    memory_processor.process_conversation.assert_awaited_once()
+    memory_engine.add_memory.assert_not_awaited()
+    conversation_manager.update_session_metadata.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -198,7 +393,7 @@ async def test_enforce_message_limit_uses_cleanup_batch_size(
         config_manager=ConfigManager(
             {
                 "recall_engine": {"top_k": 3, "injection_method": "extra_user_content"},
-                "reflection_engine": {"summary_trigger_rounds": 1},
+                "reflection_engine": {"summary_trigger_rounds": 1, "quiet_delay_seconds": 0},
                 "session_manager": {
                     "max_messages_per_session": 100,
                     "cleanup_batch_size": 20,
@@ -291,7 +486,7 @@ async def test_handle_memory_recall_injection_user_message_before(
                     "top_k": 3,
                     "injection_method": "user_message_before",
                 },
-                "reflection_engine": {"summary_trigger_rounds": 1},
+                "reflection_engine": {"summary_trigger_rounds": 1, "quiet_delay_seconds": 0},
                 "session_manager": {"max_messages_per_session": 100},
             }
         ),
@@ -334,7 +529,7 @@ async def test_handle_memory_recall_injection_user_message_after(
                     "top_k": 3,
                     "injection_method": "user_message_after",
                 },
-                "reflection_engine": {"summary_trigger_rounds": 1},
+                "reflection_engine": {"summary_trigger_rounds": 1, "quiet_delay_seconds": 0},
                 "session_manager": {"max_messages_per_session": 100},
             }
         ),
@@ -673,7 +868,7 @@ async def test_handle_memory_recall_injection_fake_tool_call(handler, memory_eng
                     "top_k": 3,
                     "injection_method": "fake_tool_call",
                 },
-                "reflection_engine": {"summary_trigger_rounds": 1},
+                "reflection_engine": {"summary_trigger_rounds": 1, "quiet_delay_seconds": 0},
                 "session_manager": {"max_messages_per_session": 100},
             }
         ),
@@ -836,7 +1031,7 @@ async def test_handle_memory_recall_fake_tool_call_fallback_on_gemini(
                     "top_k": 3,
                     "injection_method": "fake_tool_call",
                 },
-                "reflection_engine": {"summary_trigger_rounds": 1},
+                "reflection_engine": {"summary_trigger_rounds": 1, "quiet_delay_seconds": 0},
                 "session_manager": {"max_messages_per_session": 100},
             }
         ),
@@ -889,7 +1084,7 @@ async def test_handle_memory_recall_fake_tool_call_fetches_provider_for_fallback
                     "top_k": 3,
                     "injection_method": "fake_tool_call",
                 },
-                "reflection_engine": {"summary_trigger_rounds": 1},
+                "reflection_engine": {"summary_trigger_rounds": 1, "quiet_delay_seconds": 0},
                 "session_manager": {"max_messages_per_session": 100},
             }
         ),
@@ -939,7 +1134,7 @@ async def test_handle_memory_recall_fake_tool_call_fallback_logs_once(
                     "top_k": 3,
                     "injection_method": "fake_tool_call",
                 },
-                "reflection_engine": {"summary_trigger_rounds": 1},
+                "reflection_engine": {"summary_trigger_rounds": 1, "quiet_delay_seconds": 0},
                 "session_manager": {"max_messages_per_session": 100},
             }
         ),
@@ -1042,7 +1237,7 @@ async def test_handle_memory_recall_injection_fake_tool_call_deepseek_v4(
                     "use_session_filtering": False,
                     "use_persona_filtering": True,
                 },
-                "reflection_engine": {"summary_trigger_rounds": 1},
+                "reflection_engine": {"summary_trigger_rounds": 1, "quiet_delay_seconds": 0},
                 "session_manager": {"max_messages_per_session": 100},
             }
         ),
@@ -1098,7 +1293,7 @@ async def test_handle_memory_recall_non_fake_modes_do_not_fetch_provider(
                     "top_k": 3,
                     "injection_method": "user_message_before",
                 },
-                "reflection_engine": {"summary_trigger_rounds": 1},
+                "reflection_engine": {"summary_trigger_rounds": 1, "quiet_delay_seconds": 0},
                 "session_manager": {"max_messages_per_session": 100},
             }
         ),
@@ -1139,7 +1334,7 @@ def _make_handler_with_top_k_0(memory_engine, memory_processor, conversation_man
         config_manager=ConfigManager(
             {
                 "recall_engine": {"top_k": 0, "injection_method": "system_prompt"},
-                "reflection_engine": {"summary_trigger_rounds": 1},
+                "reflection_engine": {"summary_trigger_rounds": 1, "quiet_delay_seconds": 0},
                 "session_manager": {"max_messages_per_session": 100},
             }
         ),
@@ -1265,7 +1460,7 @@ async def test_system_prompt_auto_falls_back_to_extra_user_content(
                     "top_k": 3,
                     "injection_method": "system_prompt",
                 },
-                "reflection_engine": {"summary_trigger_rounds": 1},
+                "reflection_engine": {"summary_trigger_rounds": 1, "quiet_delay_seconds": 0},
                 "session_manager": {"max_messages_per_session": 100},
             }
         ),
@@ -1342,7 +1537,7 @@ async def test_context_expansion_enriches_query(
                     "injection_method": "extra_user_content",
                     "inject_with_recent_context": True,
                 },
-                "reflection_engine": {"summary_trigger_rounds": 1},
+                "reflection_engine": {"summary_trigger_rounds": 1, "quiet_delay_seconds": 0},
                 "session_manager": {"max_messages_per_session": 100},
             }
         ),
@@ -1390,7 +1585,7 @@ async def test_context_expansion_skips_when_empty(
                     "injection_method": "extra_user_content",
                     "inject_with_recent_context": True,
                 },
-                "reflection_engine": {"summary_trigger_rounds": 1},
+                "reflection_engine": {"summary_trigger_rounds": 1, "quiet_delay_seconds": 0},
                 "session_manager": {"max_messages_per_session": 100},
             }
         ),
@@ -1495,7 +1690,7 @@ async def test_pending_summary_retry_merges_range(
     ) as get_persona:
         get_persona.return_value = "persona_1"
         await handler.handle_memory_reflection(event, resp)
-        await handler.shutdown()
+        await _wait_for_storage_tasks(handler)
 
     # 应使用合并后的范围
     conversation_manager.get_messages_range.assert_awaited_once()

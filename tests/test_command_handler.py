@@ -2,7 +2,7 @@
 Tests for CommandHandler.
 """
 
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from astrbot_plugin_livingmemory.core.base.config_manager import ConfigManager
@@ -235,6 +235,35 @@ async def test_handle_cleanup_invalid_history_json_returns_clear_error(
     messages = [msg async for msg in handler.handle_cleanup(mock_event, dry_run=True)]
     assert any("解析对话历史失败" in msg for msg in messages)
     assert any("有效 JSON" in msg for msg in messages)
+
+
+@pytest.mark.asyncio
+async def test_handle_cleanup_core_database_busy_returns_clear_message(
+    config_manager, memory_engine, conversation_manager, index_validator, mock_event
+):
+    context = Mock()
+    context.conversation_manager = Mock()
+    context.conversation_manager.get_curr_conversation_id = AsyncMock(
+        side_effect=RuntimeError("sqlite3.OperationalError: database is locked")
+    )
+
+    handler = CommandHandler(
+        context=context,
+        config_manager=config_manager,
+        memory_engine=memory_engine,
+        conversation_manager=conversation_manager,
+        index_validator=index_validator,
+    )
+
+    with patch(
+        "astrbot_plugin_livingmemory.core.utils.asyncio.sleep",
+        new_callable=AsyncMock,
+    ):
+        messages = [msg async for msg in handler.handle_cleanup(mock_event, dry_run=True)]
+
+    assert any("AstrBot 对话数据库正在忙碌" in msg for msg in messages)
+    assert not any("database is locked" in msg for msg in messages)
+    assert context.conversation_manager.get_curr_conversation_id.await_count == 3
 
 
 @pytest.mark.asyncio

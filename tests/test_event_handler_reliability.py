@@ -34,7 +34,7 @@ def _make_handler() -> EventHandler:
         config_manager=ConfigManager(
             {
                 "recall_engine": {"top_k": 3, "injection_method": "extra_user_content"},
-                "reflection_engine": {"summary_trigger_rounds": 1},
+                "reflection_engine": {"summary_trigger_rounds": 1, "quiet_delay_seconds": 0},
                 "session_manager": {"max_messages_per_session": 100},
             }
         ),

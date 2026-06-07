@@ -18,6 +18,33 @@ from astrbot.api.star import Context
 from ..processors.text_processor import TextProcessor
 from .stopwords_manager import StopwordsManager, get_stopwords_manager
 
+_SQLITE_LOCK_KEYWORDS = frozenset({"database is locked", "database table is locked"})
+
+
+class CoreConversationBusy(RuntimeError):
+    """AstrBot Core conversation database is temporarily busy."""
+
+
+def _is_sqlite_lock_error(exc: Exception) -> bool:
+    return any(keyword in str(exc).lower() for keyword in _SQLITE_LOCK_KEYWORDS)
+
+
+async def _retry_core_conversation_call(label: str, session_id: str, call):
+    """Retry short AstrBot Core conversation calls when SQLite is busy."""
+    for attempt in range(1, 4):
+        try:
+            return await call()
+        except Exception as e:
+            if not _is_sqlite_lock_error(e):
+                raise
+            if attempt >= 3:
+                raise CoreConversationBusy(str(e)) from e
+            logger.debug(
+                f"[core_conversation] [{session_id}] {label} 遇到 SQLite 忙碌，"
+                f"准备第 {attempt + 1}/3 次重试"
+            )
+            await asyncio.sleep(min(0.4 * attempt, 1.5))
+
 
 def safe_parse_metadata(metadata_raw: Any) -> dict[str, Any]:
     """
@@ -179,57 +206,74 @@ async def get_persona_id(context: Context, event: AstrMessageEvent) -> str | Non
       2. conversation.persona_id（会话级绑定）
       3. 全局默认人格（最低）
     """
+    umo = getattr(event, "unified_msg_origin", "")
+    if not umo:
+        return None
+
+    # 优先级 1：session_service_config（与 _ensure_persona_and_skills 一致）
     try:
-        umo = event.unified_msg_origin
-
-        # 优先级 1：session_service_config（与 _ensure_persona_and_skills 一致）
+        session_service_config = await sp.get_async(
+            scope="umo",
+            scope_id=umo,
+            key="session_service_config",
+            default={},
+        )
         session_persona_id: str | None = (
-            await sp.get_async(
-                scope="umo",
-                scope_id=umo,
-                key="session_service_config",
-                default={},
-            )
-        ).get("persona_id")
-
+            session_service_config.get("persona_id")
+            if isinstance(session_service_config, dict)
+            else None
+        )
         if session_persona_id:
             logger.debug(
                 f"[get_persona_id] [{umo}] 使用 session_service_config 人格: {session_persona_id}"
             )
             return session_persona_id
+    except Exception as e:
+        logger.debug(f"[get_persona_id] [{umo}] 读取 session_service_config 失败: {e}")
 
-        # 优先级 2：conversation.persona_id
-        session_id = await context.conversation_manager.get_curr_conversation_id(umo)
-        if session_id is None:
-            logger.debug(f"[get_persona_id] [{umo}] 无当前会话，跳至默认人格")
-        else:
-            conversation = await context.conversation_manager.get_conversation(
-                umo, session_id
+    # 优先级 2：conversation.persona_id。这里会读 AstrBot Core SQLite，遇忙短重试。
+    try:
+        session_id = await _retry_core_conversation_call(
+            "get_curr_conversation_id",
+            umo,
+            lambda: context.conversation_manager.get_curr_conversation_id(umo),
+        )
+        if session_id:
+            conversation = await _retry_core_conversation_call(
+                "get_conversation",
+                umo,
+                lambda: context.conversation_manager.get_conversation(umo, session_id),
             )
-            persona_id = conversation.persona_id if conversation else None
-
+            persona_id = getattr(conversation, "persona_id", None)
             logger.debug(
                 f"[get_persona_id] [{umo}] 会话={session_id}, "
                 f"会话人格={persona_id or '未设置'}"
             )
-
             if persona_id == "[%None]":
-                # 明确设置为无人格
                 logger.debug(f"[get_persona_id] [{umo}] 会话明确设置为无人格")
                 return None
-
             if persona_id:
                 logger.info(f"[get_persona_id] [{umo}] 最终使用人格: {persona_id}")
                 return persona_id
+        else:
+            logger.debug(f"[get_persona_id] [{umo}] 无当前会话，跳至默认人格")
+    except CoreConversationBusy as e:
+        logger.warning(
+            f"[get_persona_id] [{umo}] AstrBot 对话资料库忙碌，"
+            f"改用默认人格继续: {e}"
+        )
+    except Exception as e:
+        logger.debug(f"[get_persona_id] [{umo}] 读取会话人格失败: {e}")
 
-        # 优先级 3：全局默认人格
+    # 优先级 3：全局默认人格
+    try:
         default_persona = await context.persona_manager.get_default_persona_v3(umo=umo)
         persona_id = default_persona["name"] if default_persona else None
         logger.debug(f"[get_persona_id] [{umo}] 使用默认人格: {persona_id or '未设置'}")
         logger.info(f"[get_persona_id] [{umo}] 最终使用人格: {persona_id or '无'}")
         return persona_id
     except Exception as e:
-        logger.debug(f"获取人格ID失败: {e}")
+        logger.debug(f"[get_persona_id] [{umo}] 获取默认人格失败: {e}")
         return None
 
 

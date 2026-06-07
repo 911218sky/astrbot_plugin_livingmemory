@@ -784,6 +784,80 @@ class ConversationStore:
             logger.error(f"更新消息metadata失败: {e}", exc_info=True)
             return False
 
+    async def replace_session_metadata(self, session_id: str, metadata: dict) -> bool:
+        """
+        替换会话metadata。
+
+        所有会话 metadata 写入都通过同一个写锁，避免与消息写入并发提交。
+        """
+        if self.connection is None:
+            return False
+
+        try:
+            async with self._write_lock:
+                await self.connection.execute(
+                    """
+                    UPDATE sessions
+                    SET metadata = ?
+                    WHERE session_id = ?
+                    """,
+                    (json.dumps(metadata, ensure_ascii=False), session_id),
+                )
+                await self.connection.commit()
+            logger.debug(f"[ConversationStore] 更新会话metadata: {session_id}")
+            return True
+        except Exception as e:
+            logger.error(f"更新会话metadata失败: {e}", exc_info=True)
+            return False
+
+    async def update_session_metadata_key(
+        self, session_id: str, key: str, value
+    ) -> bool:
+        """
+        原子更新会话 metadata 的单个 key。
+
+        读取当前 metadata、修改 key、写回数据库都在同一把写锁内完成，
+        避免多个后台任务同时更新不同 key 时互相覆盖。
+        """
+        if self.connection is None:
+            return False
+
+        try:
+            async with self._write_lock:
+                async with self.connection.execute(
+                    "SELECT metadata FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if not row:
+                    return False
+
+                try:
+                    metadata = json.loads(row["metadata"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    metadata = {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+
+                metadata[key] = value
+                await self.connection.execute(
+                    """
+                    UPDATE sessions
+                    SET metadata = ?
+                    WHERE session_id = ?
+                    """,
+                    (json.dumps(metadata, ensure_ascii=False), session_id),
+                )
+                await self.connection.commit()
+
+            logger.debug(
+                f"[ConversationStore] 更新会话metadata: {session_id}, {key}={value}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"更新会话metadata键失败: {e}", exc_info=True)
+            return False
+
     async def search_messages(
         self, session_id: str, keyword: str, limit: int = 20
     ) -> list[Message]:
