@@ -4,6 +4,7 @@ Tests for PluginPageApi — WebUI REST API endpoints and helpers.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -826,7 +827,7 @@ class TestRouteRegistration:
         plugin = FakePlugin()
         api = PluginPageApi(plugin)
         api.register_routes()
-        assert len(plugin._api_routes) == 13
+        assert len(plugin._api_routes) == 15
 
         paths = {route for route, _, _, _ in plugin._api_routes}
         prefix = PAGE_API_PREFIX
@@ -836,6 +837,8 @@ class TestRouteRegistration:
         assert f"{prefix}/memories/batch-delete" in paths
         assert f"{prefix}/import/documents" in paths
         assert f"{prefix}/import/upload" in paths
+        assert f"{prefix}/import/jobs/start" in paths
+        assert f"{prefix}/import/jobs/status" in paths
         assert f"{prefix}/export/memories" in paths
         assert f"{prefix}/recall/test" in paths
         assert f"{prefix}/graph/overview" in paths
@@ -956,6 +959,92 @@ class TestDocumentImport:
         assert entry["metadata"]["original_session_id"] == "old-session"
         assert entry["metadata"]["original_persona_id"] == "old-persona"
         assert entry["metadata"]["exported_memory_id"] == 9
+
+    @pytest.mark.asyncio
+    async def test_import_job_reports_progress_and_result(self, tmp_path):
+        class CapturingMemoryEngine(FakeMemoryEngine):
+            def __init__(self):
+                super().__init__()
+                self.entries = []
+
+            async def add_memory(self, **kwargs):
+                self.entries.append(kwargs)
+                return len(self.entries)
+
+        memory_engine = CapturingMemoryEngine()
+        api = PluginPageApi(FakePlugin(memory_engine=memory_engine))
+        document = tmp_path / "note.md"
+        document.write_text("# Job Import\n\nImported through job.", encoding="utf-8")
+
+        req = _mock_page_request(
+            get_json={
+                "mode": "documents",
+                "path": str(document),
+                "session_id": "session-job",
+            }
+        )
+        with _qp(req):
+            started = await api.start_import_job()
+
+        assert started["status"] == "ok"
+        job_id = started["data"]["job_id"]
+
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+            req = _mock_page_request(args={"job_id": job_id})
+            with _qp(req):
+                status = await api.get_import_job_status()
+            if status["data"]["status"] == "completed":
+                break
+
+        assert status["status"] == "ok"
+        assert status["data"]["status"] == "completed"
+        assert status["data"]["percent"] == 100
+        assert status["data"]["result"]["imported_count"] == 1
+        assert memory_engine.entries[0]["session_id"] == "session-job"
+
+    @pytest.mark.asyncio
+    async def test_upload_job_rejects_too_many_files_without_partial_import(self):
+        class CapturingMemoryEngine(FakeMemoryEngine):
+            def __init__(self):
+                super().__init__()
+                self.entries = []
+
+            async def add_memory(self, **kwargs):
+                self.entries.append(kwargs)
+                return len(self.entries)
+
+        memory_engine = CapturingMemoryEngine()
+        api = PluginPageApi(FakePlugin(memory_engine=memory_engine))
+        req = _mock_page_request(
+            get_json={
+                "mode": "upload",
+                "files": [
+                    {"name": f"upload-{index}.md", "content": f"# File {index}"}
+                    for index in range(3)
+                ],
+                "session_id": "session-upload-limit",
+                "max_files": 2,
+            }
+        )
+        with _qp(req):
+            started = await api.start_import_job()
+
+        assert started["status"] == "ok"
+        job_id = started["data"]["job_id"]
+
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+            req = _mock_page_request(args={"job_id": job_id})
+            with _qp(req):
+                status = await api.get_import_job_status()
+            if status["data"]["status"] == "failed":
+                break
+
+        assert status["status"] == "ok"
+        assert status["data"]["status"] == "failed"
+        assert "too many files" in status["data"]["error"]
+        assert memory_engine.entries == []
 
     @pytest.mark.asyncio
     async def test_import_documents_errors_when_all_chunks_fail(self, tmp_path):

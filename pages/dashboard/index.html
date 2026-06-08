@@ -142,6 +142,15 @@
                   <span data-i18n="import.uploadButton">Upload</span>
                 </button>
               </div>
+              <div class="import-progress hidden" id="import-progress" aria-live="polite">
+                <div class="import-progress-track">
+                  <div class="import-progress-fill" id="import-progress-fill"></div>
+                </div>
+                <div class="import-progress-meta">
+                  <span id="import-progress-label" data-i18n="import.progressIdle">Ready</span>
+                  <span id="import-progress-count">0%</span>
+                </div>
+              </div>
               <div class="import-hint" id="import-status" data-i18n="import.hint">Path is read from the AstrBot server/container filesystem. Supports .md, .markdown, .txt.</div>
             </div>
             <div class="filter-bar">

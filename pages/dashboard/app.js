@@ -956,6 +956,8 @@
       var button = document.getElementById(id);
       if (button) button.disabled = state.importBusy;
     });
+    var fileInput = document.getElementById("import-files");
+    if (fileInput) fileInput.disabled = state.importBusy;
   }
 
   function ensureImportIdle() {
@@ -1013,6 +1015,70 @@
     if (input) input.value = "";
   }
 
+  function setImportProgressVisible(visible) {
+    var progress = document.getElementById("import-progress");
+    if (progress) progress.classList.toggle("hidden", !visible);
+  }
+
+  function setImportProgress(percent, label, countLabel) {
+    var fill = document.getElementById("import-progress-fill");
+    var text = document.getElementById("import-progress-label");
+    var count = document.getElementById("import-progress-count");
+    var safePercent = Math.max(0, Math.min(100, Number(percent) || 0));
+    if (fill) fill.style.width = safePercent + "%";
+    if (text) text.textContent = label || window.t("import.progressIdle");
+    if (count) count.textContent = countLabel || (Math.round(safePercent) + "%");
+  }
+
+  function renderImportJobProgress(job) {
+    job = job || {};
+    setImportProgressVisible(true);
+    var total = Number(job.total) || 0;
+    var current = Number(job.current) || 0;
+    var percent = Number(job.percent) || 0;
+    var label = job.message || window.t("import.progressRunning");
+    var countLabel = total > 0
+      ? current + "/" + total + " · " + Math.round(percent) + "%"
+      : Math.round(percent) + "%";
+    setImportProgress(percent, label, countLabel);
+    setImportStatus(label, job.status === "failed");
+  }
+
+  function wait(ms) {
+    return new Promise(function(resolve) { setTimeout(resolve, ms); });
+  }
+
+  async function startImportJob(mode, body) {
+    setImportProgressVisible(true);
+    setImportProgress(3, window.t("import.progressQueued"), "3%");
+    var job = unwrapApiData(await apiRequest("import/jobs/start", {
+      method: "POST",
+      body: Object.assign({ mode: mode }, body || {}),
+      retries: 0,
+    })) || {};
+    renderImportJobProgress(job);
+    return await pollImportJob(job.job_id);
+  }
+
+  async function pollImportJob(jobId) {
+    if (!jobId) throw new Error(window.t("import.jobMissing"));
+    while (true) {
+      await wait(700);
+      var job = unwrapApiData(await apiRequest(
+        "import/jobs/status?job_id=" + encodeURIComponent(jobId),
+        { retries: 0 }
+      )) || {};
+      renderImportJobProgress(job);
+      if (job.status === "completed") {
+        setImportProgress(100, window.t("import.progressComplete"), "100%");
+        return job.result || {};
+      }
+      if (job.status === "failed") {
+        throw new Error(job.error || job.message || window.t("import.fail"));
+      }
+    }
+  }
+
   function updateImportImportanceLabel() {
     var slider = document.getElementById("import-importance");
     var value = document.getElementById("import-importance-value");
@@ -1042,16 +1108,15 @@
     setImportActionsDisabled(true);
     setImportStatus(window.t("import.running"));
     try {
-      var result = unwrapApiData(await apiRequest("import/documents", {
-        method: "POST",
-        body: {
+      var result = await startImportJob(
+        "documents",
+        {
           path: importPath,
           session_id: sessionId,
           persona_id: personaId || null,
           importance: importance,
-        },
-        retries: 0,
-      })) || {};
+        }
+      );
       var message = buildImportResultMessage(result, sessionId);
       var isError = importResultIsError(result);
       setImportStatus(message, isError);
@@ -1114,16 +1179,15 @@
         showToast(window.t("import.filesRequired"), true);
         return;
       }
-      var result = unwrapApiData(await apiRequest("import/upload", {
-        method: "POST",
-        body: {
+      var result = await startImportJob(
+        "upload",
+        {
           files: files,
           session_id: sessionId,
           persona_id: personaId || null,
           importance: importance,
-        },
-        retries: 0,
-      })) || {};
+        }
+      );
       var message = buildImportResultMessage(result, sessionId);
       if (upload.skipped) {
         message += " " + window.t("import.filesSkipped", upload.skipped);
@@ -1442,6 +1506,7 @@
     var importFiles = document.getElementById("import-files");
     if (importFiles) {
       importFiles.addEventListener("change", function() {
+        if (state.importBusy) return;
         var count = importFiles.files ? importFiles.files.length : 0;
         var supported = 0;
         if (importFiles.files) {

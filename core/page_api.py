@@ -9,8 +9,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
+import uuid
 from typing import Any
 
 import aiosqlite
@@ -33,6 +35,7 @@ class PluginPageApi:
 
     def __init__(self, plugin) -> None:
         self.plugin = plugin
+        self._import_jobs: dict[str, dict[str, Any]] = {}
 
     def register_routes(self) -> None:
         """注册官方插件页面所需的原生 API。"""
@@ -84,6 +87,18 @@ class PluginPageApi:
             self.upload_documents,
             ["POST"],
             "LivingMemory Page upload documents",
+        )
+        register(
+            f"{PAGE_API_PREFIX}/import/jobs/start",
+            self.start_import_job,
+            ["POST"],
+            "LivingMemory Page start import job",
+        )
+        register(
+            f"{PAGE_API_PREFIX}/import/jobs/status",
+            self.get_import_job_status,
+            ["GET"],
+            "LivingMemory Page import job status",
         )
         register(
             f"{PAGE_API_PREFIX}/export/memories",
@@ -841,6 +856,255 @@ class PluginPageApi:
                 "errors": errors,
             }
         )
+
+    async def start_import_job(self):
+        """Start an asynchronous document import/upload job for UI progress."""
+        payload = await request.get_json(silent=True) or {}
+        mode = str(payload.get("mode", "")).strip().lower()
+        if mode not in {"documents", "upload"}:
+            return self._error("匯入模式必須是 documents 或 upload")
+
+        self._prune_import_jobs()
+        job_id = uuid.uuid4().hex
+        self._import_jobs[job_id] = {
+            "job_id": job_id,
+            "mode": mode,
+            "status": "queued",
+            "phase": "queued",
+            "message": "等待匯入任務開始",
+            "current": 0,
+            "total": 0,
+            "percent": 0,
+            "result": None,
+            "error": "",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+        asyncio.create_task(self._run_import_job(job_id, mode, payload))
+        return self._ok(self._public_import_job(job_id))
+
+    async def get_import_job_status(self):
+        """Return the current state of an asynchronous import job."""
+        job_id = str(request.args.get("job_id", "")).strip()
+        if not job_id or job_id not in self._import_jobs:
+            return self._error("找不到匯入任務")
+        return self._ok(self._public_import_job(job_id))
+
+    def _public_import_job(self, job_id: str) -> dict[str, Any]:
+        job = dict(self._import_jobs.get(job_id) or {})
+        job.pop("task", None)
+        return job
+
+    def _update_import_job(self, job_id: str, **updates) -> None:
+        job = self._import_jobs.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        total = int(job.get("total") or 0)
+        current = int(job.get("current") or 0)
+        if total > 0 and "percent" not in updates:
+            job["percent"] = max(0, min(100, int(current * 100 / total)))
+        elif "percent" not in updates:
+            job["percent"] = 0
+        job["updated_at"] = time.time()
+
+    def _prune_import_jobs(self) -> None:
+        if len(self._import_jobs) <= 50:
+            return
+        cutoff = time.time() - 3600
+        for job_id, job in list(self._import_jobs.items()):
+            if job.get("updated_at", 0) < cutoff or job.get("status") in {
+                "completed",
+                "failed",
+            }:
+                self._import_jobs.pop(job_id, None)
+
+    async def _run_import_job(
+        self,
+        job_id: str,
+        mode: str,
+        payload: dict[str, Any],
+    ) -> None:
+        try:
+            result = await self._execute_import_payload(
+                payload,
+                mode=mode,
+                job_id=job_id,
+            )
+            self._update_import_job(
+                job_id,
+                status="completed",
+                phase="completed",
+                message="匯入完成",
+                current=result.get("total_chunks", 0),
+                total=result.get("total_chunks", 0),
+                percent=100,
+                result=result,
+            )
+        except (DocumentImportError, ValueError) as exc:
+            logger.warning(f"[PageAPI] 匯入任務未完成: {exc}")
+            self._update_import_job(
+                job_id,
+                status="failed",
+                phase="failed",
+                message=str(exc),
+                error=str(exc),
+            )
+        except Exception as exc:
+            logger.error(f"[PageAPI] 匯入任務失敗: {exc}", exc_info=True)
+            self._update_import_job(
+                job_id,
+                status="failed",
+                phase="failed",
+                message=str(exc),
+                error=str(exc),
+            )
+
+    async def _execute_import_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        mode: str,
+        job_id: str,
+    ) -> dict[str, Any]:
+        ready, error = await self._ensure_plugin_ready()
+        if error:
+            raise RuntimeError(error.get("message") if isinstance(error, dict) else error)
+        memory_engine = ready["memory_engine"]
+
+        session_id = str(payload.get("session_id", "")).strip()
+        persona_id = str(payload.get("persona_id", "")).strip() or None
+        if not session_id:
+            raise ValueError("需要指定目标 session_id")
+
+        try:
+            importance = self._normalize_importance(payload.get("importance", 0.7))
+            max_files = self._bounded_int(payload.get("max_files", 50), 1, 200)
+            max_chunks = self._bounded_int(payload.get("max_chunks", 200), 1, 1000)
+            chunk_size = self._bounded_int(payload.get("chunk_size", 3000), 500, 12000)
+            chunk_overlap = self._bounded_int(
+                payload.get("chunk_overlap", 300),
+                0,
+                min(chunk_size - 1, 3000),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(str(exc)) from exc
+
+        importer = DocumentImporter(
+            max_files=max_files,
+            max_chunks=max_chunks,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+        self._update_import_job(
+            job_id,
+            status="running",
+            phase="loading",
+            message="正在讀取與切分文件",
+            current=0,
+            total=0,
+            percent=5,
+        )
+        if mode == "documents":
+            import_path = str(payload.get("path", "")).strip()
+            if not import_path:
+                raise ValueError("需要提供文件或目录路径")
+            chunks = importer.load_chunks(import_path)
+            origin = "webui_document_import"
+        else:
+            files = payload.get("files", [])
+            if not isinstance(files, list) or not files:
+                raise ValueError("需要提供上传文件")
+            documents: list[tuple[str, str]] = []
+            total_chars = 0
+            for file_info in files:
+                if not isinstance(file_info, dict):
+                    continue
+                name = str(file_info.get("name", "")).strip()
+                content = file_info.get("content", "")
+                if not name or not isinstance(content, str):
+                    continue
+                content_size = len(content)
+                if content_size > MAX_UPLOAD_FILE_CHARS:
+                    raise ValueError(
+                        f"上传文件过大: {name}; 单个文件限制为 {MAX_UPLOAD_FILE_CHARS} 字符"
+                    )
+                total_chars += content_size
+                if total_chars > MAX_UPLOAD_TOTAL_CHARS:
+                    raise ValueError(
+                        f"上传内容过大; 总限制为 {MAX_UPLOAD_TOTAL_CHARS} 字符"
+                    )
+                documents.append((name, content))
+            chunks = importer.load_text_documents(documents)
+            origin = "webui_document_upload"
+
+        memory_ids: list[int] = []
+        errors: list[dict[str, Any]] = []
+        imported_at = time.time()
+        total = len(chunks)
+        self._update_import_job(
+            job_id,
+            phase="indexing",
+            message="正在產生 embedding 並寫入索引",
+            current=0,
+            total=total,
+            percent=5,
+        )
+        for index, chunk in enumerate(chunks, start=1):
+            metadata = self._build_document_import_metadata(
+                chunk,
+                session_id=session_id,
+                persona_id=persona_id,
+                importance=importance,
+                imported_at=imported_at,
+                origin=origin,
+            )
+            try:
+                memory_id = await memory_engine.add_memory(
+                    content=chunk.content,
+                    session_id=session_id,
+                    persona_id=persona_id,
+                    importance=importance,
+                    metadata=metadata,
+                )
+                memory_ids.append(memory_id)
+            except Exception as exc:
+                if len(errors) < 20:
+                    errors.append(
+                        {
+                            "source_path": chunk.source_path,
+                            "chunk_index": chunk.chunk_index,
+                            "message": str(exc),
+                        }
+                    )
+                logger.error(
+                    "[PageAPI] 文件 chunk 匯入失敗 "
+                    f"({chunk.source_path} #{chunk.chunk_index}): {exc}",
+                    exc_info=True,
+                )
+            self._update_import_job(
+                job_id,
+                phase="indexing",
+                message=f"正在產生 embedding 並寫入索引 ({index}/{total})",
+                current=index,
+                total=total,
+            )
+
+        if chunks and not memory_ids:
+            message = errors[0]["message"] if errors else "所有文件片段写入失败"
+            if mode == "upload":
+                raise RuntimeError(f"文件上传写入失败: {message}")
+            raise RuntimeError(f"文件匯入寫入失敗: {message}")
+
+        return {
+            "imported_count": len(memory_ids),
+            "failed_count": len(chunks) - len(memory_ids),
+            "total_chunks": len(chunks),
+            "session_id": session_id,
+            "persona_id": persona_id,
+            "memory_ids": memory_ids,
+            "errors": errors,
+        }
 
     async def export_memories(self):
         """Export selected or filtered memories as JSON or Markdown content."""
