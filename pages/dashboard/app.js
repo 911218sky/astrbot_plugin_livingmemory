@@ -8,6 +8,7 @@
     page: "graph",
     memory: {
       items: [],
+      sessions: [],
       total: 0,
       page: 1,
       pageSize: 20,
@@ -236,7 +237,7 @@
       p.classList.toggle("active", p.id === "page-" + name);
     });
     if (name === "graph") { fetchGraphStats(); if (window.ensureGraphScene) window.ensureGraphScene(); }
-    if (name === "memory") { fetchMemories(); }
+    if (name === "memory") { fetchMemorySessions(); fetchMemories(); }
     if (name === "system") { fetchSystemOverview(); }
   }
 
@@ -283,6 +284,7 @@
 
   function refreshDynamicI18n() {
     if (state.page === "memory") {
+      renderMemorySessionSelect();
       if (state.memory.items.length) renderMemoriesVirtual();
       else renderEmptyTable();
       updateMemoryPagination();
@@ -855,6 +857,142 @@
     }
   }
 
+  async function fetchMemorySessions() {
+    try {
+      var data = unwrapApiData(await apiRequest("stats")) || {};
+      state.memory.sessions = normalizeSessions(data);
+      renderMemorySessionSelect();
+    } catch (_) {
+      state.memory.sessions = [];
+      renderMemorySessionSelect();
+    }
+  }
+
+  function normalizeSessions(data) {
+    var sessions = data.recent_sessions || [];
+    if ((!sessions || !sessions.length) && data.sessions) {
+      sessions = Object.keys(data.sessions).map(function(k) {
+        return { session_id: k, message_count: data.sessions[k] };
+      });
+    }
+    return (Array.isArray(sessions) ? sessions : [])
+      .map(function(s) {
+        if (typeof s === "string") return { session_id: s, message_count: "" };
+        return {
+          session_id: s.session_id || "",
+          message_count: s.message_count || "",
+          last_active: s.last_active || "",
+        };
+      })
+      .filter(function(s) { return !!s.session_id; })
+      .sort(function(a, b) { return (b.message_count || 0) - (a.message_count || 0); });
+  }
+
+  function renderMemorySessionSelect() {
+    var select = document.getElementById("mem-session-select");
+    if (!select) return;
+    var current = state.memory.session || "";
+    var options = ['<option value="">' + esc(window.t("filter.sessionAll")) + '</option>'];
+    var hasCurrent = false;
+    state.memory.sessions.forEach(function(s) {
+      if (s.session_id === current) hasCurrent = true;
+      var label = s.session_id;
+      if (s.message_count) label += " (" + s.message_count + ")";
+      options.push('<option value="' + esc(s.session_id) + '">' + esc(label) + '</option>');
+    });
+    if (current && !hasCurrent) options.push('<option value="' + esc(current) + '">' + esc(current) + '</option>');
+    select.innerHTML = options.join("");
+    select.value = current;
+  }
+
+  function applyMemorySessionFilter(sessionId) {
+    state.memory.session = String(sessionId || "").trim();
+    state.memory.page = 1;
+    var input = document.getElementById("mem-session");
+    var select = document.getElementById("mem-session-select");
+    if (input) input.value = state.memory.session;
+    if (select) {
+      renderMemorySessionSelect();
+    }
+    fetchMemories();
+  }
+
+  function syncImportSessionField() {
+    var input = document.getElementById("import-session");
+    if (!input) return;
+    if (!input.value.trim() && state.memory.session) {
+      input.value = state.memory.session;
+    }
+  }
+
+  function updateImportImportanceLabel() {
+    var slider = document.getElementById("import-importance");
+    var value = document.getElementById("import-importance-value");
+    if (!slider || !value) return;
+    value.textContent = (parseFloat(slider.value) || 0).toFixed(1);
+  }
+
+  function setImportStatus(message, isError) {
+    var status = document.getElementById("import-status");
+    if (!status) return;
+    status.textContent = message || window.t("import.hint");
+    status.classList.toggle("error", !!isError);
+  }
+
+  async function runDocumentImport() {
+    var pathInput = document.getElementById("import-path");
+    var sessionInput = document.getElementById("import-session");
+    var personaInput = document.getElementById("import-persona");
+    var importanceInput = document.getElementById("import-importance");
+    var button = document.getElementById("import-documents-btn");
+
+    var importPath = pathInput ? pathInput.value.trim() : "";
+    var sessionId = sessionInput ? sessionInput.value.trim() : "";
+    var personaId = personaInput ? personaInput.value.trim() : "";
+    var importance = importanceInput ? parseFloat(importanceInput.value) : 7;
+
+    if (!importPath) return showToast(window.t("import.pathRequired"), true);
+    if (!sessionId) return showToast(window.t("import.sessionRequired"), true);
+
+    if (button) button.disabled = true;
+    setImportStatus(window.t("import.running"));
+    try {
+      var result = unwrapApiData(await apiRequest("import/documents", {
+        method: "POST",
+        body: {
+          path: importPath,
+          session_id: sessionId,
+          persona_id: personaId || null,
+          importance: importance,
+        },
+        retries: 0,
+      })) || {};
+      var message = window.t(
+        "import.success",
+        result.imported_count || 0,
+        result.total_chunks || 0,
+        result.session_id || sessionId
+      );
+      if (result.failed_count) {
+        message += " " + window.t("import.partial", result.failed_count);
+      }
+      setImportStatus(message, !!result.failed_count);
+      showToast(message, !!result.failed_count);
+      state.memory.session = sessionId;
+      state.memory.page = 1;
+      var filterInput = document.getElementById("mem-session");
+      if (filterInput) filterInput.value = sessionId;
+      await fetchMemorySessions();
+      await fetchMemories();
+    } catch (e) {
+      var errorMessage = e.message || window.t("import.fail");
+      setImportStatus(errorMessage, true);
+      showToast(errorMessage, true);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
   function renderMemoriesVirtual(options) {
     options = options || {};
     var tbody = document.getElementById("memories-body");
@@ -1076,11 +1214,24 @@
       fetchMemories();
     }, 300));
 
+    document.getElementById("mem-session-select").addEventListener("change", function() {
+      applyMemorySessionFilter(this.value);
+      syncImportSessionField();
+    });
+
     document.getElementById("mem-session").addEventListener("input", debounce(function() {
-      state.memory.session = this.value.trim();
-      state.memory.page = 1;
-      fetchMemories();
+      applyMemorySessionFilter(this.value);
+      syncImportSessionField();
     }, 300));
+
+    var importImportance = document.getElementById("import-importance");
+    if (importImportance) {
+      updateImportImportanceLabel();
+      importImportance.addEventListener("input", updateImportImportanceLabel);
+    }
+
+    var importButton = document.getElementById("import-documents-btn");
+    if (importButton) importButton.addEventListener("click", runDocumentImport);
 
     document.getElementById("mem-status").addEventListener("change", function() {
       state.memory.status = this.value;
@@ -1270,16 +1421,12 @@
         '<span class="bar-row-value">' + v + '</span></div>';
     }).join("");
 
-    var sessions = data.recent_sessions || [];
-    if (!sessions.length && data.sessions) {
-      sessions = Object.keys(data.sessions).map(function(k) {
-        return { session_id: k, message_count: data.sessions[k] };
-      }).sort(function(a, b) { return b.message_count - a.message_count; }).slice(0, 10);
-    }
+    var sessions = normalizeSessions(data).slice(0, 10);
     document.getElementById("session-list").innerHTML = sessions.length
       ? sessions.map(function(s) {
-        return '<div class="session-item"><span class="session-id">' + esc(s.session_id || s) + '</span>' +
-          '<span class="session-meta">' + (s.message_count || "") + (s.last_active ? ' · ' + esc(s.last_active) : '') + '</span></div>';
+        return '<button class="session-item" type="button" data-session-id="' + esc(s.session_id) + '" title="' + esc(window.t("system.openSession")) + '">' +
+          '<span class="session-id">' + esc(s.session_id) + '</span>' +
+          '<span class="session-meta">' + (s.message_count || "") + (s.last_active ? ' · ' + esc(s.last_active) : '') + '</span></button>';
       }).join("")
       : '<div style="color:var(--text-tertiary);text-align:center;padding:20px">' + window.t("system.noActiveSessions") + '</div>';
 
@@ -1296,6 +1443,17 @@
           '<span class="backup-files">' + esc(window.t("system.files", b.file_count || b.files_copied || 0)) + '</span></div>';
       }).join("")
       : '<div style="color:var(--text-tertiary);text-align:center;padding:20px">' + window.t("system.noBackups") + '</div>';
+  }
+
+  function initSessionListActions() {
+    var list = document.getElementById("session-list");
+    if (!list) return;
+    list.addEventListener("click", function(e) {
+      var item = e.target.closest(".session-item[data-session-id]");
+      if (!item) return;
+      applyMemorySessionFilter(item.dataset.sessionId || "");
+      switchPage("memory");
+    });
   }
 
   function atomLabel(type) {
@@ -1338,6 +1496,7 @@
     initSidebar();
     initMemoryPage();
     initRecallPage();
+    initSessionListActions();
 
     document.getElementById("peek-close").addEventListener("click", closePeek);
     document.getElementById("peek-overlay").addEventListener("click", closePeek);

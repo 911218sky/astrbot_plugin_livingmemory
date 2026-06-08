@@ -819,11 +819,11 @@ class TestEnsurePluginReady:
 
 
 class TestRouteRegistration:
-    def test_registers_all_ten_routes(self):
+    def test_registers_all_page_routes(self):
         plugin = FakePlugin()
         api = PluginPageApi(plugin)
         api.register_routes()
-        assert len(plugin._api_routes) == 10
+        assert len(plugin._api_routes) == 11
 
         paths = {route for route, _, _, _ in plugin._api_routes}
         prefix = PAGE_API_PREFIX
@@ -831,6 +831,7 @@ class TestRouteRegistration:
         assert f"{prefix}/memories" in paths
         assert f"{prefix}/memories/update" in paths
         assert f"{prefix}/memories/batch-delete" in paths
+        assert f"{prefix}/import/documents" in paths
         assert f"{prefix}/recall/test" in paths
         assert f"{prefix}/graph/overview" in paths
         assert f"{prefix}/graph/query" in paths
@@ -838,3 +839,59 @@ class TestRouteRegistration:
 
     def test_route_prefix_contains_plugin_name(self):
         assert PLUGIN_NAME in PAGE_API_PREFIX
+
+
+# ---------------------------------------------------------------------------
+# Document import
+# ---------------------------------------------------------------------------
+
+
+class TestDocumentImport:
+    @pytest.mark.asyncio
+    async def test_import_documents_requires_session(self, api, tmp_path):
+        document = tmp_path / "note.md"
+        document.write_text("# Note\n\nContent", encoding="utf-8")
+
+        req = _mock_page_request(get_json={"path": str(document), "session_id": ""})
+        with _qp(req):
+            result = await api.import_documents()
+
+        assert result["status"] == "error"
+        assert "session_id" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_import_documents_adds_document_chunks(self, tmp_path):
+        class CapturingMemoryEngine(FakeMemoryEngine):
+            def __init__(self):
+                super().__init__()
+                self.entries = []
+
+            async def add_memory(self, **kwargs):
+                self.entries.append(kwargs)
+                return len(self.entries)
+
+        memory_engine = CapturingMemoryEngine()
+        api = PluginPageApi(FakePlugin(memory_engine=memory_engine))
+        document = tmp_path / "note.md"
+        document.write_text("# Import Title\n\nImported content.", encoding="utf-8")
+
+        req = _mock_page_request(
+            get_json={
+                "path": str(document),
+                "session_id": "session-a",
+                "persona_id": "persona-a",
+                "importance": 8,
+            }
+        )
+        with _qp(req):
+            result = await api.import_documents()
+
+        assert result["status"] == "ok"
+        assert result["data"]["imported_count"] == 1
+        assert result["data"]["failed_count"] == 0
+        assert memory_engine.entries[0]["content"] == "# Import Title\n\nImported content."
+        assert memory_engine.entries[0]["session_id"] == "session-a"
+        assert memory_engine.entries[0]["persona_id"] == "persona-a"
+        assert memory_engine.entries[0]["importance"] == 0.8
+        assert memory_engine.entries[0]["metadata"]["memory_type"] == "DOCUMENT_IMPORT"
+        assert memory_engine.entries[0]["metadata"]["import_title"] == "Import Title"

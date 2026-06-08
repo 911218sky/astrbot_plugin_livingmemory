@@ -115,8 +115,29 @@
             <span class="page-title" data-i18n="nav.memory">Memories</span>
           </header>
           <div class="page-body">
+            <div class="import-panel">
+              <div class="import-panel-title" data-i18n="import.title">Document Import</div>
+              <div class="import-form">
+                <input type="text" id="import-path" class="input" data-i18n-placeholder="import.pathPh" placeholder="/path/to/notes or /path/to/file.md" />
+                <input type="text" id="import-session" class="input input-sm" data-i18n-placeholder="import.sessionPh" placeholder="Target session_id" />
+                <input type="text" id="import-persona" class="input input-sm" data-i18n-placeholder="import.personaPh" placeholder="Persona ID (optional)" />
+                <label class="import-importance">
+                  <span data-i18n="import.importance">Importance</span>
+                  <input type="range" id="import-importance" min="0" max="10" step="0.5" value="7" />
+                  <span id="import-importance-value">7.0</span>
+                </label>
+                <button class="btn btn-primary btn-sm" id="import-documents-btn">
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5"/><path d="M12 3v12"/></svg>
+                  <span data-i18n="import.button">Import</span>
+                </button>
+              </div>
+              <div class="import-hint" id="import-status" data-i18n="import.hint">Path is read from the AstrBot server/container filesystem. Supports .md, .markdown, .txt.</div>
+            </div>
             <div class="filter-bar">
               <input type="text" id="mem-keyword" class="input" data-i18n-placeholder="filter.keyword" placeholder="Search by keyword or memory ID..." />
+              <select id="mem-session-select" class="select input" style="max-width:220px">
+                <option value="" data-i18n="filter.sessionAll">All Sessions</option>
+              </select>
               <input type="text" id="mem-session" class="input" data-i18n-placeholder="filter.sessionId" placeholder="Session ID" style="max-width:200px" />
               <select id="mem-status" class="select input">
                 <option value="all" data-i18n="filter.statusAll">All Status</option>

@@ -856,6 +856,72 @@ body {
   max-width: 400px;
 }
 
+/* ----- Document Import ----------------------------------------- */
+.import-panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  padding: var(--space-3);
+  margin-bottom: var(--space-4);
+  box-shadow: var(--shadow-xs);
+}
+
+.import-panel-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: var(--space-3);
+}
+
+.import-form {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+.import-form .input {
+  min-width: 160px;
+}
+
+.import-form #import-path {
+  flex: 1 1 320px;
+  min-width: 240px;
+}
+
+.import-importance {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 32px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.import-importance input[type="range"] {
+  width: 110px;
+  accent-color: var(--accent);
+}
+
+#import-importance-value {
+  width: 28px;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.import-hint {
+  margin-top: var(--space-2);
+  color: var(--text-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.import-hint.error {
+  color: var(--danger);
+}
+
 /* ----- Graph Canvas -------------------------------------------- */
 .graph-canvas-container {
   position: relative;
@@ -1704,8 +1770,22 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: var(--space-3);
+  width: 100%;
   padding: var(--space-3) 0;
   border-bottom: 1px solid var(--border-light);
+  background: transparent;
+  border-left: 0;
+  border-right: 0;
+  border-top: 0;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.session-item:hover {
+  background: var(--bg-hover);
 }
 
 .session-item:last-child {
@@ -1719,11 +1799,13 @@ body {
   max-width: 260px;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .session-meta {
   font-size: 11px;
   color: var(--text-tertiary);
+  flex-shrink: 0;
 }
 
 .backup-list {

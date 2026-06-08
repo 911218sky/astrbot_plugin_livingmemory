@@ -64,6 +64,7 @@
     /* ---- Filter ---- */
     "filter.keyword":     { zh: "关键字（支持 memory_id / 内容搜索）", en: "Keyword (memory_id / content)", ru: "Ключевое слово (memory_id / контент)" },
     "filter.sessionId":   { zh: "会话 ID（可选）", en: "Session ID (optional)", ru: "ID сессии (опц.)" },
+    "filter.sessionAll":  { zh: "全部会话", en: "All Sessions", ru: "Все сессии" },
     "filter.statusAll":   { zh: "全部状态", en: "All Statuses", ru: "Все статусы" },
     "filter.statusActive":{ zh: "活跃", en: "Active", ru: "Активно" },
     "filter.statusArchived":{ zh: "已归档", en: "Archived", ru: "Архив" },
@@ -72,6 +73,21 @@
     "filter.selectAll":   { zh: "全选", en: "Select All", ru: "Выбрать все" },
     "filter.deleteSelected":{ zh: "删除选中", en: "Delete Selected", ru: "Удалить выбранное" },
     "filter.selectedCount":{ zh: "已选择 {0} 条", en: "{0} selected", ru: "Выбрано {0}" },
+
+    /* ---- Import ---- */
+    "import.title":       { zh: "文件匯入", en: "Document Import", ru: "Импорт документов" },
+    "import.pathPh":      { zh: "伺服器路徑：/path/to/notes 或 /path/to/file.md", en: "Server path: /path/to/notes or /path/to/file.md", ru: "Путь на сервере: /path/to/notes или /path/to/file.md" },
+    "import.sessionPh":   { zh: "目標 session_id", en: "Target session_id", ru: "Целевой session_id" },
+    "import.personaPh":   { zh: "persona_id（可選）", en: "Persona ID (optional)", ru: "Persona ID (опц.)" },
+    "import.importance":  { zh: "重要性", en: "Importance", ru: "Важность" },
+    "import.button":      { zh: "匯入", en: "Import", ru: "Импорт" },
+    "import.hint":        { zh: "路徑會從 AstrBot 伺服器/容器檔案系統讀取，支援 .md、.markdown、.txt。", en: "Path is read from the AstrBot server/container filesystem. Supports .md, .markdown, .txt.", ru: "Путь читается из файловой системы сервера/контейнера AstrBot. Поддерживаются .md, .markdown, .txt." },
+    "import.running":     { zh: "正在匯入文件...", en: "Importing documents...", ru: "Импорт документов..." },
+    "import.success":     { zh: "已匯入 {0}/{1} 個片段到 session {2}", en: "Imported {0}/{1} chunks into session {2}", ru: "Импортировано {0}/{1} фрагментов в session {2}" },
+    "import.partial":     { zh: "{0} 個片段失敗，請查看後端日誌。", en: "{0} chunks failed; check backend logs.", ru: "{0} фрагментов не импортировано; проверьте журналы." },
+    "import.fail":        { zh: "文件匯入失敗", en: "Document import failed", ru: "Ошибка импорта документов" },
+    "import.pathRequired":{ zh: "請輸入要匯入的文件或目錄路徑", en: "Enter a document or directory path to import", ru: "Введите путь к документу или каталогу" },
+    "import.sessionRequired":{ zh: "請指定要寫入的目標 session_id", en: "Enter the target session_id", ru: "Введите целевой session_id" },
 
     /* ---- Table ---- */
     "table.id":           { zh: "记忆 ID", en: "Memory ID", ru: "ID памяти" },
@@ -349,6 +365,7 @@
     "system.importanceDistribution":{ zh: "重要性分布", en: "Importance Distribution", ru: "Распределение важности" },
     "system.atomTypes":   { zh: "原子类型", en: "Atom Types", ru: "Типы атомов" },
     "system.activeSessions":{ zh: "活跃会话", en: "Active Sessions", ru: "Активные сессии" },
+    "system.openSession": { zh: "查看此会话的记忆", en: "View memories for this session", ru: "Показать память этой сессии" },
     "system.versionBackups":{ zh: "版本备份", en: "Version Backups", ru: "Резервные копии" },
     "system.noActiveSessions":{ zh: "暂无活跃会话", en: "No active sessions", ru: "Нет активных сессий" },
     "system.noBackups":   { zh: "暂无备份", en: "No backups", ru: "Нет резервных копий" },

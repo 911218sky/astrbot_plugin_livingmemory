@@ -18,6 +18,7 @@ from quart import request
 
 from astrbot.api import logger
 
+from .importers import DocumentImportError, DocumentImporter
 from .managers.backup_manager import BackupManager
 from .utils.number_utils import clamp_float, safe_float
 
@@ -69,6 +70,12 @@ class PluginPageApi:
             self.batch_update_memories,
             ["POST"],
             "LivingMemory Page batch update memories",
+        )
+        register(
+            f"{PAGE_API_PREFIX}/import/documents",
+            self.import_documents,
+            ["POST"],
+            "LivingMemory Page import documents",
         )
         register(
             f"{PAGE_API_PREFIX}/recall/test",
@@ -609,6 +616,97 @@ class PluginPageApi:
             }
         )
 
+    async def import_documents(self):
+        """Import Markdown/text files from the server filesystem into a session."""
+        ready, error = await self._ensure_plugin_ready()
+        if error:
+            return error
+        memory_engine = ready["memory_engine"]
+
+        payload = await request.get_json(silent=True) or {}
+        import_path = str(payload.get("path", "")).strip()
+        session_id = str(payload.get("session_id", "")).strip()
+        persona_id = str(payload.get("persona_id", "")).strip() or None
+
+        if not import_path:
+            return self._error("需要提供文件或目录路径")
+        if not session_id:
+            return self._error("需要指定目标 session_id")
+
+        try:
+            importance = self._normalize_importance(payload.get("importance", 0.7))
+            max_files = self._bounded_int(payload.get("max_files", 50), 1, 200)
+            max_chunks = self._bounded_int(payload.get("max_chunks", 200), 1, 1000)
+            chunk_size = self._bounded_int(payload.get("chunk_size", 3000), 500, 12000)
+            chunk_overlap = self._bounded_int(
+                payload.get("chunk_overlap", 300),
+                0,
+                min(chunk_size - 1, 3000),
+            )
+        except (TypeError, ValueError) as exc:
+            return self._error(str(exc))
+
+        try:
+            importer = DocumentImporter(
+                max_files=max_files,
+                max_chunks=max_chunks,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+            )
+            chunks = importer.load_chunks(import_path)
+        except DocumentImportError as exc:
+            return self._error(str(exc))
+        except Exception as exc:
+            logger.error(f"[PageAPI] 文件匯入掃描失敗: {exc}", exc_info=True)
+            return self._error(str(exc))
+
+        memory_ids: list[int] = []
+        errors: list[dict[str, Any]] = []
+        imported_at = time.time()
+        for chunk in chunks:
+            metadata = self._build_document_import_metadata(
+                chunk,
+                session_id=session_id,
+                persona_id=persona_id,
+                importance=importance,
+                imported_at=imported_at,
+            )
+            try:
+                memory_id = await memory_engine.add_memory(
+                    content=chunk.content,
+                    session_id=session_id,
+                    persona_id=persona_id,
+                    importance=importance,
+                    metadata=metadata,
+                )
+                memory_ids.append(memory_id)
+            except Exception as exc:
+                if len(errors) < 20:
+                    errors.append(
+                        {
+                            "source_path": chunk.source_path,
+                            "chunk_index": chunk.chunk_index,
+                            "message": str(exc),
+                        }
+                    )
+                logger.error(
+                    "[PageAPI] 文件 chunk 匯入失敗 "
+                    f"({chunk.source_path} #{chunk.chunk_index}): {exc}",
+                    exc_info=True,
+                )
+
+        return self._ok(
+            {
+                "imported_count": len(memory_ids),
+                "failed_count": len(chunks) - len(memory_ids),
+                "total_chunks": len(chunks),
+                "session_id": session_id,
+                "persona_id": persona_id,
+                "memory_ids": memory_ids,
+                "errors": errors,
+            }
+        )
+
     async def test_recall(self):
         ready, error = await self._ensure_plugin_ready()
         if error:
@@ -992,6 +1090,49 @@ class PluginPageApi:
         if parsed <= 1.0:
             parsed *= 10.0
         return round(max(0.0, min(10.0, parsed)), 2)
+
+    @staticmethod
+    def _normalize_importance(value: Any) -> float:
+        parsed = float(value)
+        if 0.0 <= parsed <= 1.0:
+            return parsed
+        if 0.0 <= parsed <= 10.0:
+            return parsed / 10.0
+        raise ValueError("重要性必须在 0-1 或 0-10 范围内")
+
+    @staticmethod
+    def _bounded_int(value: Any, minimum: int, maximum: int) -> int:
+        parsed = int(value)
+        return max(minimum, min(maximum, parsed))
+
+    @staticmethod
+    def _build_document_import_metadata(
+        chunk,
+        *,
+        session_id: str,
+        persona_id: str | None,
+        importance: float,
+        imported_at: float,
+    ) -> dict[str, Any]:
+        excerpt = " ".join(chunk.content.split())[:500]
+        source_label = f"{chunk.title} ({chunk.chunk_index}/{chunk.chunk_count})"
+        return {
+            "session_id": session_id,
+            "persona_id": persona_id,
+            "importance": importance,
+            "status": "active",
+            "memory_type": "DOCUMENT_IMPORT",
+            "memory_origin": "webui_document_import",
+            "canonical_summary": source_label,
+            "persona_summary": source_label,
+            "key_facts": [excerpt] if excerpt else [],
+            "topics": [chunk.title],
+            "import_source_path": chunk.source_path,
+            "import_title": chunk.title,
+            "import_chunk_index": chunk.chunk_index,
+            "import_chunk_count": chunk.chunk_count,
+            "imported_at": imported_at,
+        }
 
     @classmethod
     def _append_update_history(
