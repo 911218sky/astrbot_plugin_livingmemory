@@ -902,6 +902,84 @@ class TestDocumentImport:
         assert memory_engine.entries[0]["metadata"]["import_title"] == "Import Title"
 
     @pytest.mark.asyncio
+    async def test_import_documents_restores_livingmemory_json_export(self, tmp_path):
+        class CapturingMemoryEngine(FakeMemoryEngine):
+            def __init__(self):
+                super().__init__()
+                self.entries = []
+
+            async def add_memory(self, **kwargs):
+                self.entries.append(kwargs)
+                return len(self.entries)
+
+        memory_engine = CapturingMemoryEngine()
+        api = PluginPageApi(FakePlugin(memory_engine=memory_engine))
+        export_file = tmp_path / "livingmemory-export.json"
+        export_file.write_text(
+            json.dumps(
+                {
+                    "items": [
+                        {
+                            "id": 9,
+                            "doc_id": "doc-9",
+                            "text": "Restored memory text.",
+                            "metadata": {
+                                "session_id": "old-session",
+                                "persona_id": "old-persona",
+                                "memory_type": "GENERAL",
+                                "canonical_summary": "Restored summary",
+                                "topics": ["saved"],
+                            },
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        req = _mock_page_request(
+            get_json={
+                "path": str(export_file),
+                "session_id": "new-session",
+                "persona_id": "new-persona",
+            }
+        )
+
+        with _qp(req):
+            result = await api.import_documents()
+
+        assert result["status"] == "ok"
+        assert result["data"]["imported_count"] == 1
+        entry = memory_engine.entries[0]
+        assert entry["content"] == "Restored memory text."
+        assert entry["session_id"] == "new-session"
+        assert entry["metadata"]["canonical_summary"] == "Restored summary"
+        assert entry["metadata"]["original_session_id"] == "old-session"
+        assert entry["metadata"]["original_persona_id"] == "old-persona"
+        assert entry["metadata"]["exported_memory_id"] == 9
+
+    @pytest.mark.asyncio
+    async def test_import_documents_errors_when_all_chunks_fail(self, tmp_path):
+        class FailingMemoryEngine(FakeMemoryEngine):
+            async def add_memory(self, **kwargs):
+                raise RuntimeError("write failed")
+
+        api = PluginPageApi(FakePlugin(memory_engine=FailingMemoryEngine()))
+        document = tmp_path / "note.md"
+        document.write_text("# Import Title\n\nImported content.", encoding="utf-8")
+        req = _mock_page_request(
+            get_json={
+                "path": str(document),
+                "session_id": "session-a",
+            }
+        )
+
+        with _qp(req):
+            result = await api.import_documents()
+
+        assert result["status"] == "error"
+        assert "write failed" in result["message"]
+
+    @pytest.mark.asyncio
     async def test_upload_documents_adds_uploaded_chunks(self):
         class CapturingMemoryEngine(FakeMemoryEngine):
             def __init__(self):

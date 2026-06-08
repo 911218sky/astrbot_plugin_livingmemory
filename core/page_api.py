@@ -709,6 +709,10 @@ class PluginPageApi:
                     exc_info=True,
                 )
 
+        if chunks and not memory_ids:
+            message = errors[0]["message"] if errors else "所有文件片段写入失败"
+            return self._error(f"文件匯入寫入失敗: {message}")
+
         return self._ok(
             {
                 "imported_count": len(memory_ids),
@@ -1303,7 +1307,9 @@ class PluginPageApi:
     ) -> dict[str, Any]:
         excerpt = " ".join(chunk.content.split())[:500]
         source_label = f"{chunk.title} ({chunk.chunk_index}/{chunk.chunk_count})"
-        return {
+        source_metadata = getattr(chunk, "metadata", None) or {}
+        exported_metadata = source_metadata.get("exported_metadata") or {}
+        metadata = {
             "session_id": session_id,
             "persona_id": persona_id,
             "importance": importance,
@@ -1320,6 +1326,26 @@ class PluginPageApi:
             "import_chunk_count": chunk.chunk_count,
             "imported_at": imported_at,
         }
+        if isinstance(exported_metadata, dict):
+            for key in (
+                "status",
+                "memory_type",
+                "canonical_summary",
+                "persona_summary",
+                "key_facts",
+                "topics",
+            ):
+                if exported_metadata.get(key):
+                    metadata[key] = exported_metadata[key]
+            metadata["original_session_id"] = exported_metadata.get("session_id")
+            metadata["original_persona_id"] = exported_metadata.get("persona_id")
+        if source_metadata.get("exported_memory_id") is not None:
+            metadata["import_origin"] = "livingmemory_export"
+            metadata["exported_memory_id"] = source_metadata.get("exported_memory_id")
+            metadata["exported_doc_id"] = source_metadata.get("exported_doc_id")
+            metadata["exported_created_at"] = source_metadata.get("exported_created_at")
+            metadata["exported_updated_at"] = source_metadata.get("exported_updated_at")
+        return metadata
 
     async def _query_export_memories(
         self,

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 class DocumentImportError(ValueError):
@@ -20,12 +22,13 @@ class DocumentChunk:
     content: str
     chunk_index: int
     chunk_count: int
+    metadata: dict[str, Any] | None = None
 
 
 class DocumentImporter:
     """Scan Markdown/text files and split them into bounded chunks."""
 
-    SUPPORTED_EXTENSIONS = frozenset({".md", ".markdown", ".txt"})
+    SUPPORTED_EXTENSIONS = frozenset({".md", ".markdown", ".txt", ".json"})
 
     def __init__(
         self,
@@ -71,6 +74,14 @@ class DocumentImporter:
             if not normalized:
                 continue
 
+            if Path(source_name).suffix.lower() == ".json":
+                chunks.extend(self._load_livingmemory_json(source_name, normalized))
+                if len(chunks) > self.max_chunks:
+                    raise DocumentImportError(
+                        f"too many chunks; limit is {self.max_chunks}"
+                    )
+                continue
+
             raw_chunks = self._split_text(normalized)
             chunk_count = len(raw_chunks)
             title = self._extract_title(normalized, Path(source_name))
@@ -91,6 +102,55 @@ class DocumentImporter:
 
         if not chunks:
             raise DocumentImportError("no importable document content found")
+        return chunks
+
+    def _load_livingmemory_json(
+        self,
+        source_name: str,
+        text: str,
+    ) -> list[DocumentChunk]:
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise DocumentImportError(f"invalid JSON export: {source_name}") from exc
+
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            raise DocumentImportError(
+                "JSON import must be a LivingMemory export with an items array"
+            )
+
+        chunks: list[DocumentChunk] = []
+        for index, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                continue
+            content = self._normalize_text(str(item.get("text") or ""))
+            if not content:
+                continue
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            title = (
+                str(metadata.get("canonical_summary") or "").strip()
+                or self._extract_title(content, Path(source_name))
+            )
+            chunks.append(
+                DocumentChunk(
+                    source_path=f"{source_name}#memory-{item.get('id', index)}",
+                    title=title[:120],
+                    content=content,
+                    chunk_index=1,
+                    chunk_count=1,
+                    metadata={
+                        "exported_memory_id": item.get("id"),
+                        "exported_doc_id": item.get("doc_id"),
+                        "exported_metadata": metadata,
+                        "exported_created_at": item.get("created_at"),
+                        "exported_updated_at": item.get("updated_at"),
+                    },
+                )
+            )
+
+        if not chunks:
+            raise DocumentImportError("no importable memories found in JSON export")
         return chunks
 
     def _collect_files(self, import_path: str) -> list[Path]:
@@ -126,7 +186,7 @@ class DocumentImporter:
         return path.suffix.lower() in self.SUPPORTED_EXTENSIONS
 
     def _read_text(self, path: Path) -> str:
-        for encoding in ("utf-8", "utf-8-sig", "gb18030"):
+        for encoding in ("utf-8-sig", "utf-8", "gb18030"):
             try:
                 return path.read_text(encoding=encoding)
             except UnicodeDecodeError:

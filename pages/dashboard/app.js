@@ -20,6 +20,7 @@
     },
     selectedMemory: null,
     isEditing: false,
+    importBusy: false,
     _detailCache: null,
     _nodeDetailCache: null,
     _recallCache: null,
@@ -899,10 +900,17 @@
 
   function renderMemorySessionSelect() {
     var select = document.getElementById("mem-session-select");
-    if (!select) return;
     var current = state.memory.session || "";
-    var options = ['<option value="">' + esc(window.t("filter.sessionAll")) + '</option>'];
-    var hasCurrent = false;
+    if (select) {
+      select.innerHTML = buildSessionOptions(current, window.t("filter.sessionAll")).join("");
+      select.value = current;
+    }
+    renderImportSessionSelect();
+  }
+
+  function buildSessionOptions(current, emptyLabel) {
+    var options = ['<option value="">' + esc(emptyLabel) + '</option>'];
+    var hasCurrent = !current;
     state.memory.sessions.forEach(function(s) {
       if (s.session_id === current) hasCurrent = true;
       var label = s.session_id;
@@ -910,7 +918,14 @@
       options.push('<option value="' + esc(s.session_id) + '">' + esc(label) + '</option>');
     });
     if (current && !hasCurrent) options.push('<option value="' + esc(current) + '">' + esc(current) + '</option>');
-    select.innerHTML = options.join("");
+    return options;
+  }
+
+  function renderImportSessionSelect() {
+    var select = document.getElementById("import-session");
+    if (!select) return;
+    var current = select.value || state.memory.session || "";
+    select.innerHTML = buildSessionOptions(current, window.t("import.sessionPh")).join("");
     select.value = current;
   }
 
@@ -927,11 +942,75 @@
   }
 
   function syncImportSessionField() {
-    var input = document.getElementById("import-session");
-    if (!input) return;
-    if (!input.value.trim() && state.memory.session) {
-      input.value = state.memory.session;
+    var select = document.getElementById("import-session");
+    if (!select) return;
+    renderImportSessionSelect();
+    if (!select.value && state.memory.session) {
+      select.value = state.memory.session;
     }
+  }
+
+  function setImportActionsDisabled(disabled) {
+    state.importBusy = !!disabled;
+    ["import-documents-btn", "upload-documents-btn"].forEach(function(id) {
+      var button = document.getElementById(id);
+      if (button) button.disabled = state.importBusy;
+    });
+  }
+
+  function ensureImportIdle() {
+    if (state.importBusy) {
+      showToast(window.t("import.busy"), true);
+      return false;
+    }
+    return true;
+  }
+
+  function readImportSessionId() {
+    var sessionInput = document.getElementById("import-session");
+    return sessionInput ? sessionInput.value.trim() : "";
+  }
+
+  function readImportPersonaId() {
+    var personaInput = document.getElementById("import-persona");
+    return personaInput ? personaInput.value.trim() : "";
+  }
+
+  function readImportImportance() {
+    var importanceInput = document.getElementById("import-importance");
+    return importanceInput ? parseFloat(importanceInput.value) : 7;
+  }
+
+  function buildImportResultMessage(result, fallbackSessionId) {
+    var message = window.t(
+      "import.success",
+      result.imported_count || 0,
+      result.total_chunks || 0,
+      result.session_id || fallbackSessionId
+    );
+    if (result.failed_count) {
+      message += " " + window.t("import.partial", result.failed_count);
+    }
+    return message;
+  }
+
+  function importResultIsError(result) {
+    return !!(result.failed_count || (result.total_chunks && !result.imported_count));
+  }
+
+  async function refreshImportedSession(sessionId) {
+    state.memory.session = sessionId;
+    state.memory.page = 1;
+    var filterInput = document.getElementById("mem-session");
+    if (filterInput) filterInput.value = sessionId;
+    await fetchMemorySessions();
+    await fetchMemories();
+    syncImportSessionField();
+  }
+
+  function clearSelectedUploadFiles() {
+    var input = document.getElementById("import-files");
+    if (input) input.value = "";
   }
 
   function updateImportImportanceLabel() {
@@ -949,21 +1028,18 @@
   }
 
   async function runDocumentImport() {
+    if (!ensureImportIdle()) return;
     var pathInput = document.getElementById("import-path");
-    var sessionInput = document.getElementById("import-session");
-    var personaInput = document.getElementById("import-persona");
-    var importanceInput = document.getElementById("import-importance");
-    var button = document.getElementById("import-documents-btn");
 
     var importPath = pathInput ? pathInput.value.trim() : "";
-    var sessionId = sessionInput ? sessionInput.value.trim() : "";
-    var personaId = personaInput ? personaInput.value.trim() : "";
-    var importance = importanceInput ? parseFloat(importanceInput.value) : 7;
+    var sessionId = readImportSessionId();
+    var personaId = readImportPersonaId();
+    var importance = readImportImportance();
 
     if (!importPath) return showToast(window.t("import.pathRequired"), true);
     if (!sessionId) return showToast(window.t("import.sessionRequired"), true);
 
-    if (button) button.disabled = true;
+    setImportActionsDisabled(true);
     setImportStatus(window.t("import.running"));
     try {
       var result = unwrapApiData(await apiRequest("import/documents", {
@@ -976,29 +1052,17 @@
         },
         retries: 0,
       })) || {};
-      var message = window.t(
-        "import.success",
-        result.imported_count || 0,
-        result.total_chunks || 0,
-        result.session_id || sessionId
-      );
-      if (result.failed_count) {
-        message += " " + window.t("import.partial", result.failed_count);
-      }
-      setImportStatus(message, !!result.failed_count);
-      showToast(message, !!result.failed_count);
-      state.memory.session = sessionId;
-      state.memory.page = 1;
-      var filterInput = document.getElementById("mem-session");
-      if (filterInput) filterInput.value = sessionId;
-      await fetchMemorySessions();
-      await fetchMemories();
+      var message = buildImportResultMessage(result, sessionId);
+      var isError = importResultIsError(result);
+      setImportStatus(message, isError);
+      showToast(message, isError);
+      await refreshImportedSession(sessionId);
     } catch (e) {
       var errorMessage = e.message || window.t("import.fail");
       setImportStatus(errorMessage, true);
       showToast(errorMessage, true);
     } finally {
-      if (button) button.disabled = false;
+      setImportActionsDisabled(false);
     }
   }
 
@@ -1006,7 +1070,7 @@
     var input = document.getElementById("import-files");
     var fileList = input && input.files ? Array.prototype.slice.call(input.files) : [];
     if (!fileList.length) return { files: [], skipped: 0, total: 0 };
-    var supported = /\.(md|markdown|txt)$/i;
+    var supported = /\.(md|markdown|txt|json)$/i;
     var files = [];
     var skipped = 0;
     var totalChars = 0;
@@ -1033,17 +1097,13 @@
   }
 
   async function runDocumentUpload() {
-    var sessionInput = document.getElementById("import-session");
-    var personaInput = document.getElementById("import-persona");
-    var importanceInput = document.getElementById("import-importance");
-    var button = document.getElementById("upload-documents-btn");
-
-    var sessionId = sessionInput ? sessionInput.value.trim() : "";
-    var personaId = personaInput ? personaInput.value.trim() : "";
-    var importance = importanceInput ? parseFloat(importanceInput.value) : 7;
+    if (!ensureImportIdle()) return;
+    var sessionId = readImportSessionId();
+    var personaId = readImportPersonaId();
+    var importance = readImportImportance();
 
     if (!sessionId) return showToast(window.t("import.sessionRequired"), true);
-    if (button) button.disabled = true;
+    setImportActionsDisabled(true);
     setImportStatus(window.t("import.uploading"));
 
     try {
@@ -1064,32 +1124,21 @@
         },
         retries: 0,
       })) || {};
-      var message = window.t(
-        "import.success",
-        result.imported_count || 0,
-        result.total_chunks || 0,
-        result.session_id || sessionId
-      );
-      if (result.failed_count) {
-        message += " " + window.t("import.partial", result.failed_count);
-      }
+      var message = buildImportResultMessage(result, sessionId);
       if (upload.skipped) {
         message += " " + window.t("import.filesSkipped", upload.skipped);
       }
-      setImportStatus(message, !!result.failed_count);
-      showToast(message, !!result.failed_count);
-      state.memory.session = sessionId;
-      state.memory.page = 1;
-      var filterInput = document.getElementById("mem-session");
-      if (filterInput) filterInput.value = sessionId;
-      await fetchMemorySessions();
-      await fetchMemories();
+      var isError = importResultIsError(result);
+      setImportStatus(message, isError);
+      showToast(message, isError);
+      if (!isError) clearSelectedUploadFiles();
+      await refreshImportedSession(sessionId);
     } catch (e) {
       var errorMessage = e.message || window.t("import.uploadFail");
       setImportStatus(errorMessage, true);
       showToast(errorMessage, true);
     } finally {
-      if (button) button.disabled = false;
+      setImportActionsDisabled(false);
     }
   }
 
@@ -1397,7 +1446,7 @@
         var supported = 0;
         if (importFiles.files) {
           Array.prototype.forEach.call(importFiles.files, function(file) {
-            if (/\.(md|markdown|txt)$/i.test(file.name || "")) supported += 1;
+            if (/\.(md|markdown|txt|json)$/i.test(file.name || "")) supported += 1;
           });
         }
         var skipped = count - supported;
