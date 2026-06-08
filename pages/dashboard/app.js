@@ -993,6 +993,134 @@
     }
   }
 
+  async function readSelectedUploadFiles() {
+    var input = document.getElementById("import-files");
+    var fileList = input && input.files ? Array.prototype.slice.call(input.files) : [];
+    if (!fileList.length) return [];
+    var supported = /\.(md|markdown|txt)$/i;
+    var files = [];
+    for (var i = 0; i < fileList.length; i++) {
+      var file = fileList[i];
+      if (!supported.test(file.name || "")) continue;
+      files.push({
+        name: file.name,
+        content: await file.text(),
+      });
+    }
+    return files;
+  }
+
+  async function runDocumentUpload() {
+    var sessionInput = document.getElementById("import-session");
+    var personaInput = document.getElementById("import-persona");
+    var importanceInput = document.getElementById("import-importance");
+    var button = document.getElementById("upload-documents-btn");
+
+    var sessionId = sessionInput ? sessionInput.value.trim() : "";
+    var personaId = personaInput ? personaInput.value.trim() : "";
+    var importance = importanceInput ? parseFloat(importanceInput.value) : 7;
+
+    if (!sessionId) return showToast(window.t("import.sessionRequired"), true);
+    if (button) button.disabled = true;
+    setImportStatus(window.t("import.uploading"));
+
+    try {
+      var files = await readSelectedUploadFiles();
+      if (!files.length) {
+        setImportStatus(window.t("import.filesRequired"), true);
+        showToast(window.t("import.filesRequired"), true);
+        return;
+      }
+      var result = unwrapApiData(await apiRequest("import/upload", {
+        method: "POST",
+        body: {
+          files: files,
+          session_id: sessionId,
+          persona_id: personaId || null,
+          importance: importance,
+        },
+        retries: 0,
+      })) || {};
+      var message = window.t(
+        "import.success",
+        result.imported_count || 0,
+        result.total_chunks || 0,
+        result.session_id || sessionId
+      );
+      if (result.failed_count) {
+        message += " " + window.t("import.partial", result.failed_count);
+      }
+      setImportStatus(message, !!result.failed_count);
+      showToast(message, !!result.failed_count);
+      state.memory.session = sessionId;
+      state.memory.page = 1;
+      var filterInput = document.getElementById("mem-session");
+      if (filterInput) filterInput.value = sessionId;
+      await fetchMemorySessions();
+      await fetchMemories();
+    } catch (e) {
+      var errorMessage = e.message || window.t("import.uploadFail");
+      setImportStatus(errorMessage, true);
+      showToast(errorMessage, true);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  function selectedMemoryIds() {
+    var ids = [];
+    state.memory.selected.forEach(function(key) {
+      var id = parseInt(String(key).replace("m:", ""));
+      if (!isNaN(id)) ids.push(id);
+    });
+    return ids;
+  }
+
+  function downloadTextFile(filename, mimeType, content) {
+    var blob = new Blob([content || ""], { type: mimeType || "text/plain;charset=utf-8" });
+    var url = URL.createObjectURL(blob);
+    var link = document.createElement("a");
+    link.href = url;
+    link.download = filename || "livingmemory-export.txt";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+  }
+
+  async function runMemoryExport() {
+    var button = document.getElementById("export-memories-btn");
+    var formatSelect = document.getElementById("export-format");
+    var format = formatSelect ? formatSelect.value : "json";
+    var ids = selectedMemoryIds();
+
+    if (button) button.disabled = true;
+    showToast(window.t("export.running"));
+    try {
+      var data = unwrapApiData(await apiRequest("export/memories", {
+        method: "POST",
+        body: {
+          format: format,
+          memory_ids: ids,
+          session_id: ids.length ? "" : state.memory.session,
+          keyword: ids.length ? "" : state.memory.keyword,
+          status: ids.length ? "all" : state.memory.status,
+        },
+        retries: 0,
+      })) || {};
+      if (!data.count) {
+        showToast(window.t("export.empty"), true);
+        return;
+      }
+      downloadTextFile(data.filename, data.mime_type, data.content);
+      showToast(window.t("export.success", data.count));
+    } catch (e) {
+      showToast(e.message || window.t("export.fail"), true);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
   function renderMemoriesVirtual(options) {
     options = options || {};
     var tbody = document.getElementById("memories-body");
@@ -1232,6 +1360,20 @@
 
     var importButton = document.getElementById("import-documents-btn");
     if (importButton) importButton.addEventListener("click", runDocumentImport);
+
+    var uploadButton = document.getElementById("upload-documents-btn");
+    if (uploadButton) uploadButton.addEventListener("click", runDocumentUpload);
+
+    var importFiles = document.getElementById("import-files");
+    if (importFiles) {
+      importFiles.addEventListener("change", function() {
+        var count = importFiles.files ? importFiles.files.length : 0;
+        setImportStatus(count ? window.t("import.filesSelected", count) : window.t("import.hint"));
+      });
+    }
+
+    var exportButton = document.getElementById("export-memories-btn");
+    if (exportButton) exportButton.addEventListener("click", runMemoryExport);
 
     document.getElementById("mem-status").addEventListener("change", function() {
       state.memory.status = this.value;

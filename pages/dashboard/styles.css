@@ -884,6 +884,18 @@ body {
   min-width: 160px;
 }
 
+.file-input-btn {
+  position: relative;
+  overflow: hidden;
+}
+
+.file-input-btn input[type="file"] {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
 .import-form #import-path {
   flex: 1 1 320px;
   min-width: 240px;
@@ -920,6 +932,11 @@ body {
 
 .import-hint.error {
   color: var(--danger);
+}
+
+.export-format {
+  min-width: 120px !important;
+  flex: 0 0 auto !important;
 }
 
 /* ----- Graph Canvas -------------------------------------------- */

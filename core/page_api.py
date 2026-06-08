@@ -78,6 +78,18 @@ class PluginPageApi:
             "LivingMemory Page import documents",
         )
         register(
+            f"{PAGE_API_PREFIX}/import/upload",
+            self.upload_documents,
+            ["POST"],
+            "LivingMemory Page upload documents",
+        )
+        register(
+            f"{PAGE_API_PREFIX}/export/memories",
+            self.export_memories,
+            ["POST"],
+            "LivingMemory Page export memories",
+        )
+        register(
             f"{PAGE_API_PREFIX}/recall/test",
             self.test_recall,
             ["POST"],
@@ -707,6 +719,163 @@ class PluginPageApi:
             }
         )
 
+    async def upload_documents(self):
+        """Import browser-uploaded Markdown/text content into a session."""
+        ready, error = await self._ensure_plugin_ready()
+        if error:
+            return error
+        memory_engine = ready["memory_engine"]
+
+        payload = await request.get_json(silent=True) or {}
+        session_id = str(payload.get("session_id", "")).strip()
+        persona_id = str(payload.get("persona_id", "")).strip() or None
+        files = payload.get("files", [])
+
+        if not session_id:
+            return self._error("需要指定目标 session_id")
+        if not isinstance(files, list) or not files:
+            return self._error("需要提供上传文件")
+
+        try:
+            importance = self._normalize_importance(payload.get("importance", 0.7))
+            max_files = self._bounded_int(payload.get("max_files", 50), 1, 200)
+            max_chunks = self._bounded_int(payload.get("max_chunks", 200), 1, 1000)
+            chunk_size = self._bounded_int(payload.get("chunk_size", 3000), 500, 12000)
+            chunk_overlap = self._bounded_int(
+                payload.get("chunk_overlap", 300),
+                0,
+                min(chunk_size - 1, 3000),
+            )
+        except (TypeError, ValueError) as exc:
+            return self._error(str(exc))
+
+        documents: list[tuple[str, str]] = []
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            content = item.get("content", "")
+            if not name or not isinstance(content, str):
+                continue
+            documents.append((name, content))
+
+        try:
+            importer = DocumentImporter(
+                max_files=max_files,
+                max_chunks=max_chunks,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+            )
+            chunks = importer.load_text_documents(documents)
+        except DocumentImportError as exc:
+            return self._error(str(exc))
+        except Exception as exc:
+            logger.error(f"[PageAPI] 上传文件解析失败: {exc}", exc_info=True)
+            return self._error(str(exc))
+
+        memory_ids: list[int] = []
+        errors: list[dict[str, Any]] = []
+        imported_at = time.time()
+        for chunk in chunks:
+            metadata = self._build_document_import_metadata(
+                chunk,
+                session_id=session_id,
+                persona_id=persona_id,
+                importance=importance,
+                imported_at=imported_at,
+                origin="webui_document_upload",
+            )
+            try:
+                memory_id = await memory_engine.add_memory(
+                    content=chunk.content,
+                    session_id=session_id,
+                    persona_id=persona_id,
+                    importance=importance,
+                    metadata=metadata,
+                )
+                memory_ids.append(memory_id)
+            except Exception as exc:
+                if len(errors) < 20:
+                    errors.append(
+                        {
+                            "source_path": chunk.source_path,
+                            "chunk_index": chunk.chunk_index,
+                            "message": str(exc),
+                        }
+                    )
+                logger.error(
+                    "[PageAPI] 上传文件 chunk 匯入失敗 "
+                    f"({chunk.source_path} #{chunk.chunk_index}): {exc}",
+                    exc_info=True,
+                )
+
+        return self._ok(
+            {
+                "imported_count": len(memory_ids),
+                "failed_count": len(chunks) - len(memory_ids),
+                "total_chunks": len(chunks),
+                "session_id": session_id,
+                "persona_id": persona_id,
+                "memory_ids": memory_ids,
+                "errors": errors,
+            }
+        )
+
+    async def export_memories(self):
+        """Export selected or filtered memories as JSON or Markdown content."""
+        ready, error = await self._ensure_plugin_ready()
+        if error:
+            return error
+        memory_engine = ready["memory_engine"]
+
+        payload = await request.get_json(silent=True) or {}
+        export_format = str(payload.get("format", "json")).strip().lower()
+        if export_format not in {"json", "markdown"}:
+            return self._error("导出格式必须是 json 或 markdown")
+
+        try:
+            limit = self._bounded_int(payload.get("limit", 5000), 1, 10000)
+        except (TypeError, ValueError) as exc:
+            return self._error(str(exc))
+
+        db_path = getattr(memory_engine, "db_path", None)
+        if not db_path:
+            return self._error("MemoryEngine db_path unavailable")
+
+        try:
+            rows = await self._query_export_memories(db_path, payload, limit)
+        except Exception as exc:
+            logger.error(f"[PageAPI] 导出记忆失败: {exc}", exc_info=True)
+            return self._error(str(exc))
+
+        timestamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        if export_format == "markdown":
+            content = self._format_memories_markdown(rows)
+            filename = f"livingmemory-export-{timestamp}.md"
+            mime_type = "text/markdown;charset=utf-8"
+        else:
+            content = json.dumps(
+                {
+                    "exported_at": time.time(),
+                    "total": len(rows),
+                    "items": rows,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            filename = f"livingmemory-export-{timestamp}.json"
+            mime_type = "application/json;charset=utf-8"
+
+        return self._ok(
+            {
+                "filename": filename,
+                "mime_type": mime_type,
+                "format": export_format,
+                "count": len(rows),
+                "content": content,
+            }
+        )
+
     async def test_recall(self):
         ready, error = await self._ensure_plugin_ready()
         if error:
@@ -1113,6 +1282,7 @@ class PluginPageApi:
         persona_id: str | None,
         importance: float,
         imported_at: float,
+        origin: str = "webui_document_import",
     ) -> dict[str, Any]:
         excerpt = " ".join(chunk.content.split())[:500]
         source_label = f"{chunk.title} ({chunk.chunk_index}/{chunk.chunk_count})"
@@ -1122,7 +1292,7 @@ class PluginPageApi:
             "importance": importance,
             "status": "active",
             "memory_type": "DOCUMENT_IMPORT",
-            "memory_origin": "webui_document_import",
+            "memory_origin": origin,
             "canonical_summary": source_label,
             "persona_summary": source_label,
             "key_facts": [excerpt] if excerpt else [],
@@ -1133,6 +1303,136 @@ class PluginPageApi:
             "import_chunk_count": chunk.chunk_count,
             "imported_at": imported_at,
         }
+
+    async def _query_export_memories(
+        self,
+        db_path: str,
+        payload: dict[str, Any],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        memory_ids = payload.get("memory_ids", [])
+        session_id = str(payload.get("session_id", "")).strip() or None
+        keyword = str(payload.get("keyword", "")).strip()
+        status_filter = str(payload.get("status", "all")).strip().lower() or "all"
+
+        where_clauses: list[str] = []
+        params: list[Any] = []
+
+        if isinstance(memory_ids, list) and memory_ids:
+            valid_ids: list[int] = []
+            for raw_id in memory_ids[:limit]:
+                try:
+                    valid_ids.append(int(raw_id))
+                except (TypeError, ValueError):
+                    continue
+            if not valid_ids:
+                return []
+            placeholders = ", ".join("?" for _ in valid_ids)
+            where_clauses.append(f"id IN ({placeholders})")
+            params.extend(valid_ids)
+        else:
+            if session_id:
+                where_clauses.append(
+                    "CASE WHEN json_valid(metadata) "
+                    "THEN json_extract(metadata, '$.session_id') END = ?"
+                )
+                params.append(session_id)
+
+            if status_filter != "all":
+                where_clauses.append(
+                    "COALESCE("
+                    "CASE WHEN json_valid(metadata) "
+                    "THEN json_extract(metadata, '$.status') END,"
+                    "'active'"
+                    ") = ?"
+                )
+                params.append(status_filter)
+
+            if keyword:
+                keyword_like = f"%{keyword}%"
+                if keyword.isdigit():
+                    where_clauses.append(
+                        "(CAST(id AS TEXT) = ? OR text LIKE ? COLLATE NOCASE)"
+                    )
+                    params.extend([keyword, keyword_like])
+                else:
+                    where_clauses.append(
+                        "("
+                        "text LIKE ? COLLATE NOCASE "
+                        "OR COALESCE("
+                        "CASE WHEN json_valid(metadata) "
+                        "THEN json_extract(metadata, '$.memory_type') END,"
+                        "''"
+                        ") LIKE ? COLLATE NOCASE"
+                        ")"
+                    )
+                    params.extend([keyword_like, keyword_like])
+
+        where_clause = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        sort_expr = (
+            "COALESCE("
+            "CASE WHEN json_valid(metadata) "
+            "THEN CAST(json_extract(metadata, '$.create_time') AS REAL) END,"
+            "0)"
+        )
+
+        rows: list[dict[str, Any]] = []
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                f"""
+                SELECT id, doc_id, text, metadata, created_at, updated_at
+                FROM documents
+                {where_clause}
+                ORDER BY {sort_expr} DESC, id DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            )
+            db_rows = await cursor.fetchall()
+
+        for row in db_rows:
+            metadata = self._normalize_metadata(row["metadata"])
+            rows.append(
+                {
+                    "id": row["id"],
+                    "doc_id": row["doc_id"],
+                    "text": row["text"],
+                    "metadata": metadata,
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _format_memories_markdown(rows: list[dict[str, Any]]) -> str:
+        lines = [
+            "# LivingMemory Export",
+            "",
+            f"- Total: {len(rows)}",
+            "",
+        ]
+        for row in rows:
+            metadata = row.get("metadata") or {}
+            title = metadata.get("canonical_summary") or row.get("text", "")[:80]
+            title = " ".join(str(title).split()) or f"Memory {row.get('id')}"
+            lines.extend(
+                [
+                    f"## {title}",
+                    "",
+                    f"- Memory ID: {row.get('id')}",
+                    f"- Type: {metadata.get('memory_type', 'GENERAL')}",
+                    f"- Session: {metadata.get('session_id') or ''}",
+                    f"- Persona: {metadata.get('persona_id') or ''}",
+                    f"- Importance: {metadata.get('importance', '')}",
+                    f"- Status: {metadata.get('status', 'active')}",
+                    "",
+                    str(row.get("text") or "").strip(),
+                    "",
+                ]
+            )
+        return "\n".join(lines).rstrip() + "\n"
 
     @classmethod
     def _append_update_history(

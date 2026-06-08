@@ -38,6 +38,22 @@ def test_splits_large_document_with_overlap(tmp_path):
     assert all(len(chunk.content) <= 500 for chunk in chunks)
 
 
+def test_loads_uploaded_text_documents():
+    chunks = DocumentImporter(chunk_size=500, chunk_overlap=50).load_text_documents(
+        [("upload.md", "# Uploaded\n\nMemory body.")]
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].source_path == "upload.md"
+    assert chunks[0].title == "Uploaded"
+    assert chunks[0].content == "# Uploaded\n\nMemory body."
+
+
+def test_skips_unsupported_uploaded_documents():
+    with pytest.raises(DocumentImportError, match="no importable"):
+        DocumentImporter().load_text_documents([("data.json", "{}")])
+
+
 def test_rejects_too_many_supported_files(tmp_path):
     for index in range(3):
         (tmp_path / f"note-{index}.md").write_text("content", encoding="utf-8")

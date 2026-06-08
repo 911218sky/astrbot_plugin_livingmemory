@@ -47,20 +47,37 @@ class DocumentImporter:
     def load_chunks(self, import_path: str) -> list[DocumentChunk]:
         """Load all supported files under import_path and return import chunks."""
         files = self._collect_files(import_path)
-        chunks: list[DocumentChunk] = []
+        documents = []
         for file_path in files:
-            text = self._read_text(file_path)
+            documents.append((str(file_path), self._read_text(file_path)))
+        return self.load_text_documents(documents)
+
+    def load_text_documents(
+        self,
+        documents: list[tuple[str, str]],
+    ) -> list[DocumentChunk]:
+        """Load already-decoded text documents and return import chunks."""
+        if not documents:
+            raise DocumentImportError("no uploaded documents found")
+        if len(documents) > self.max_files:
+            raise DocumentImportError(f"too many files; limit is {self.max_files}")
+
+        chunks: list[DocumentChunk] = []
+        for source_path, text in documents:
+            source_name = str(source_path or "uploaded-document").strip()
+            if not self._is_supported(Path(source_name)):
+                continue
             normalized = self._normalize_text(text)
             if not normalized:
                 continue
 
             raw_chunks = self._split_text(normalized)
             chunk_count = len(raw_chunks)
-            title = self._extract_title(normalized, file_path)
+            title = self._extract_title(normalized, Path(source_name))
             for index, content in enumerate(raw_chunks, start=1):
                 chunks.append(
                     DocumentChunk(
-                        source_path=str(file_path),
+                        source_path=source_name,
                         title=title,
                         content=content,
                         chunk_index=index,

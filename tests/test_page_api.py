@@ -4,6 +4,8 @@ Tests for PluginPageApi — WebUI REST API endpoints and helpers.
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -823,7 +825,7 @@ class TestRouteRegistration:
         plugin = FakePlugin()
         api = PluginPageApi(plugin)
         api.register_routes()
-        assert len(plugin._api_routes) == 11
+        assert len(plugin._api_routes) == 13
 
         paths = {route for route, _, _, _ in plugin._api_routes}
         prefix = PAGE_API_PREFIX
@@ -832,6 +834,8 @@ class TestRouteRegistration:
         assert f"{prefix}/memories/update" in paths
         assert f"{prefix}/memories/batch-delete" in paths
         assert f"{prefix}/import/documents" in paths
+        assert f"{prefix}/import/upload" in paths
+        assert f"{prefix}/export/memories" in paths
         assert f"{prefix}/recall/test" in paths
         assert f"{prefix}/graph/overview" in paths
         assert f"{prefix}/graph/query" in paths
@@ -895,3 +899,110 @@ class TestDocumentImport:
         assert memory_engine.entries[0]["importance"] == 0.8
         assert memory_engine.entries[0]["metadata"]["memory_type"] == "DOCUMENT_IMPORT"
         assert memory_engine.entries[0]["metadata"]["import_title"] == "Import Title"
+
+    @pytest.mark.asyncio
+    async def test_upload_documents_adds_uploaded_chunks(self):
+        class CapturingMemoryEngine(FakeMemoryEngine):
+            def __init__(self):
+                super().__init__()
+                self.entries = []
+
+            async def add_memory(self, **kwargs):
+                self.entries.append(kwargs)
+                return len(self.entries)
+
+        memory_engine = CapturingMemoryEngine()
+        api = PluginPageApi(FakePlugin(memory_engine=memory_engine))
+        req = _mock_page_request(
+            get_json={
+                "files": [{"name": "upload.md", "content": "# Uploaded\n\nBody"}],
+                "session_id": "session-b",
+                "importance": 6,
+            }
+        )
+        with _qp(req):
+            result = await api.upload_documents()
+
+        assert result["status"] == "ok"
+        assert result["data"]["imported_count"] == 1
+        assert memory_engine.entries[0]["content"] == "# Uploaded\n\nBody"
+        assert memory_engine.entries[0]["importance"] == 0.6
+        assert (
+            memory_engine.entries[0]["metadata"]["memory_origin"]
+            == "webui_document_upload"
+        )
+
+
+class TestMemoryExport:
+    def _make_export_db(self, tmp_path):
+        db_path = tmp_path / "memories.sqlite"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE documents (
+                id INTEGER PRIMARY KEY,
+                doc_id TEXT,
+                text TEXT,
+                metadata TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                1,
+                "1",
+                "First exported memory",
+                json.dumps(
+                    {
+                        "session_id": "session-export",
+                        "status": "active",
+                        "importance": 0.7,
+                        "memory_type": "DOCUMENT_IMPORT",
+                        "canonical_summary": "Export title",
+                        "create_time": 100,
+                    }
+                ),
+                "created",
+                "updated",
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return str(db_path)
+
+    @pytest.mark.asyncio
+    async def test_export_memories_json(self, tmp_path):
+        memory_engine = FakeMemoryEngine(db_path=self._make_export_db(tmp_path))
+        api = PluginPageApi(FakePlugin(memory_engine=memory_engine))
+        req = _mock_page_request(
+            get_json={"format": "json", "session_id": "session-export"}
+        )
+
+        with _qp(req):
+            result = await api.export_memories()
+
+        assert result["status"] == "ok"
+        assert result["data"]["count"] == 1
+        assert result["data"]["filename"].endswith(".json")
+        exported = json.loads(result["data"]["content"])
+        assert exported["items"][0]["text"] == "First exported memory"
+
+    @pytest.mark.asyncio
+    async def test_export_memories_markdown_for_selected_ids(self, tmp_path):
+        memory_engine = FakeMemoryEngine(db_path=self._make_export_db(tmp_path))
+        api = PluginPageApi(FakePlugin(memory_engine=memory_engine))
+        req = _mock_page_request(
+            get_json={"format": "markdown", "memory_ids": [1]}
+        )
+
+        with _qp(req):
+            result = await api.export_memories()
+
+        assert result["status"] == "ok"
+        assert result["data"]["count"] == 1
+        assert result["data"]["filename"].endswith(".md")
+        assert "## Export title" in result["data"]["content"]
+        assert "First exported memory" in result["data"]["content"]
