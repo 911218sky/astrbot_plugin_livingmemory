@@ -93,7 +93,11 @@
     "import.pathRequired":{ zh: "請輸入要匯入的文件或目錄路徑", en: "Enter a document or directory path to import", ru: "Введите путь к документу или каталогу" },
     "import.sessionRequired":{ zh: "請指定要寫入的目標 session_id", en: "Enter the target session_id", ru: "Введите целевой session_id" },
     "import.filesRequired":{ zh: "請選擇要上傳的 .md 或 .txt 文件", en: "Choose .md or .txt files to upload", ru: "Выберите .md или .txt файлы для загрузки" },
-    "import.filesSelected":{ zh: "已選擇 {0} 個檔案", en: "{0} files selected", ru: "Выбрано файлов: {0}" },
+    "import.filesSelected":{ zh: "已選擇 {0} 個可上傳檔案", en: "{0} uploadable files selected", ru: "Выбрано файлов для загрузки: {0}" },
+    "import.filesSelectedWithSkipped":{ zh: "已選擇 {0} 個可上傳檔案，略過 {1} 個不支援格式", en: "{0} uploadable files selected; {1} unsupported skipped", ru: "Выбрано файлов для загрузки: {0}; неподдерживаемых пропущено: {1}" },
+    "import.filesSkipped": { zh: "已略過 {0} 個不支援格式檔案。", en: "Skipped {0} unsupported files.", ru: "Пропущено неподдерживаемых файлов: {0}." },
+    "import.fileTooLarge": { zh: "{0} 太大，單檔限制約 {1}", en: "{0} is too large; per-file limit is about {1}", ru: "{0} слишком большой; лимит на файл около {1}" },
+    "import.totalTooLarge":{ zh: "選取的文件太大，單批總限制約 {0}", en: "Selected documents are too large; total batch limit is about {0}", ru: "Выбранные документы слишком большие; общий лимит около {0}" },
 
     /* ---- Export ---- */
     "export.button":      { zh: "匯出", en: "Export", ru: "Экспорт" },

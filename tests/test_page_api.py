@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from astrbot_plugin_livingmemory.core.page_api import (
+    MAX_UPLOAD_FILE_CHARS,
     PAGE_API_PREFIX,
     PLUGIN_NAME,
     PluginPageApi,
@@ -931,6 +932,47 @@ class TestDocumentImport:
             memory_engine.entries[0]["metadata"]["memory_origin"]
             == "webui_document_upload"
         )
+
+    @pytest.mark.asyncio
+    async def test_upload_documents_rejects_oversized_file(self):
+        api = PluginPageApi(FakePlugin())
+        req = _mock_page_request(
+            get_json={
+                "files": [
+                    {
+                        "name": "huge.md",
+                        "content": "x" * (MAX_UPLOAD_FILE_CHARS + 1),
+                    }
+                ],
+                "session_id": "session-b",
+            }
+        )
+
+        with _qp(req):
+            result = await api.upload_documents()
+
+        assert result["status"] == "error"
+        assert "上传文件过大" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_upload_documents_errors_when_all_chunks_fail(self):
+        class FailingMemoryEngine(FakeMemoryEngine):
+            async def add_memory(self, **kwargs):
+                raise RuntimeError("write failed")
+
+        api = PluginPageApi(FakePlugin(memory_engine=FailingMemoryEngine()))
+        req = _mock_page_request(
+            get_json={
+                "files": [{"name": "upload.md", "content": "# Uploaded\n\nBody"}],
+                "session_id": "session-b",
+            }
+        )
+
+        with _qp(req):
+            result = await api.upload_documents()
+
+        assert result["status"] == "error"
+        assert "write failed" in result["message"]
 
 
 class TestMemoryExport:

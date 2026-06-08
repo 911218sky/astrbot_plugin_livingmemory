@@ -26,6 +26,8 @@
     _systemCache: null,
     pendingSearch: null,
   };
+  const MAX_UPLOAD_FILE_CHARS = 2 * 1024 * 1024;
+  const MAX_UPLOAD_TOTAL_CHARS = 10 * 1024 * 1024;
 
   /* ================================================================
      Bridge Helpers
@@ -82,6 +84,13 @@
     if (!Number.isFinite(n)) n = 0.5;
     if (n <= 1) n *= 10;
     return Math.min(10, Math.max(0, n));
+  }
+
+  function formatBytes(value) {
+    var n = Number(value) || 0;
+    if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + " MiB";
+    if (n >= 1024) return (n / 1024).toFixed(1) + " KiB";
+    return n + " B";
   }
 
   function getDetailText(detail) {
@@ -996,18 +1005,31 @@
   async function readSelectedUploadFiles() {
     var input = document.getElementById("import-files");
     var fileList = input && input.files ? Array.prototype.slice.call(input.files) : [];
-    if (!fileList.length) return [];
+    if (!fileList.length) return { files: [], skipped: 0, total: 0 };
     var supported = /\.(md|markdown|txt)$/i;
     var files = [];
+    var skipped = 0;
+    var totalChars = 0;
     for (var i = 0; i < fileList.length; i++) {
       var file = fileList[i];
-      if (!supported.test(file.name || "")) continue;
+      if (!supported.test(file.name || "")) {
+        skipped += 1;
+        continue;
+      }
+      if (file.size > MAX_UPLOAD_FILE_CHARS) {
+        throw new Error(window.t("import.fileTooLarge", file.name || "", formatBytes(MAX_UPLOAD_FILE_CHARS)));
+      }
+      var content = await file.text();
+      totalChars += content.length;
+      if (totalChars > MAX_UPLOAD_TOTAL_CHARS) {
+        throw new Error(window.t("import.totalTooLarge", formatBytes(MAX_UPLOAD_TOTAL_CHARS)));
+      }
       files.push({
         name: file.name,
-        content: await file.text(),
+        content: content,
       });
     }
-    return files;
+    return { files: files, skipped: skipped, total: fileList.length };
   }
 
   async function runDocumentUpload() {
@@ -1025,7 +1047,8 @@
     setImportStatus(window.t("import.uploading"));
 
     try {
-      var files = await readSelectedUploadFiles();
+      var upload = await readSelectedUploadFiles();
+      var files = upload.files;
       if (!files.length) {
         setImportStatus(window.t("import.filesRequired"), true);
         showToast(window.t("import.filesRequired"), true);
@@ -1049,6 +1072,9 @@
       );
       if (result.failed_count) {
         message += " " + window.t("import.partial", result.failed_count);
+      }
+      if (upload.skipped) {
+        message += " " + window.t("import.filesSkipped", upload.skipped);
       }
       setImportStatus(message, !!result.failed_count);
       showToast(message, !!result.failed_count);
@@ -1368,7 +1394,17 @@
     if (importFiles) {
       importFiles.addEventListener("change", function() {
         var count = importFiles.files ? importFiles.files.length : 0;
-        setImportStatus(count ? window.t("import.filesSelected", count) : window.t("import.hint"));
+        var supported = 0;
+        if (importFiles.files) {
+          Array.prototype.forEach.call(importFiles.files, function(file) {
+            if (/\.(md|markdown|txt)$/i.test(file.name || "")) supported += 1;
+          });
+        }
+        var skipped = count - supported;
+        var message = skipped
+          ? window.t("import.filesSelectedWithSkipped", supported, skipped)
+          : window.t("import.filesSelected", supported);
+        setImportStatus(count ? message : window.t("import.hint"));
       });
     }
 

@@ -24,6 +24,8 @@ from .utils.number_utils import clamp_float, safe_float
 
 PLUGIN_NAME = "astrbot_plugin_livingmemory"
 PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"
+MAX_UPLOAD_FILE_CHARS = 2 * 1024 * 1024
+MAX_UPLOAD_TOTAL_CHARS = 10 * 1024 * 1024
 
 
 class PluginPageApi:
@@ -750,6 +752,7 @@ class PluginPageApi:
             return self._error(str(exc))
 
         documents: list[tuple[str, str]] = []
+        total_chars = 0
         for item in files:
             if not isinstance(item, dict):
                 continue
@@ -757,6 +760,16 @@ class PluginPageApi:
             content = item.get("content", "")
             if not name or not isinstance(content, str):
                 continue
+            content_size = len(content)
+            if content_size > MAX_UPLOAD_FILE_CHARS:
+                return self._error(
+                    f"上传文件过大: {name}; 单个文件限制为 {MAX_UPLOAD_FILE_CHARS} 字符"
+                )
+            total_chars += content_size
+            if total_chars > MAX_UPLOAD_TOTAL_CHARS:
+                return self._error(
+                    f"上传内容过大; 总限制为 {MAX_UPLOAD_TOTAL_CHARS} 字符"
+                )
             documents.append((name, content))
 
         try:
@@ -808,6 +821,10 @@ class PluginPageApi:
                     f"({chunk.source_path} #{chunk.chunk_index}): {exc}",
                     exc_info=True,
                 )
+
+        if chunks and not memory_ids:
+            message = errors[0]["message"] if errors else "所有文件片段写入失败"
+            return self._error(f"文件上传写入失败: {message}")
 
         return self._ok(
             {
