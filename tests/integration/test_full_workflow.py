@@ -38,6 +38,7 @@ def setup_bundle():
     memory_processor.process_conversation = AsyncMock(
         return_value=("摘要", {"topics": ["测试"]}, 0.7)
     )
+    memory_processor.classify_atoms_from_metadata = Mock(return_value=[])
 
     conversation_manager = Mock()
     conversation_manager.add_message_from_event = AsyncMock(
@@ -123,7 +124,7 @@ async def test_recall_reflection_and_search_workflow(setup_bundle):
     req.extra_user_content_parts = []
 
     with patch(
-        "astrbot_plugin_livingmemory.core.event_handler.get_persona_id",
+        "astrbot_plugin_livingmemory.core.event_handler_modules.memory_recall.get_persona_id",
         new_callable=AsyncMock,
     ) as get_persona:
         get_persona.return_value = "persona_a"
@@ -133,7 +134,7 @@ async def test_recall_reflection_and_search_workflow(setup_bundle):
 
     resp = Mock(role="assistant", completion_text="助手回复", tools_call_name=None, tools_call_extra_content=None)
     with patch(
-        "astrbot_plugin_livingmemory.core.event_handler.get_persona_id",
+        "astrbot_plugin_livingmemory.core.event_handler_modules.memory_reflection.get_persona_id",
         new_callable=AsyncMock,
     ) as get_persona:
         get_persona.return_value = "persona_a"

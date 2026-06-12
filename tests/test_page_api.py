@@ -4,18 +4,16 @@ Tests for PluginPageApi — WebUI REST API endpoints and helpers.
 
 from __future__ import annotations
 
-import asyncio
 import json
-import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiosqlite
 import pytest
 from astrbot_plugin_livingmemory.core.page_api import (
-    MAX_UPLOAD_FILE_CHARS,
     PAGE_API_PREFIX,
     PLUGIN_NAME,
     PluginPageApi,
@@ -125,17 +123,27 @@ def _mock_page_request(**overrides):
 def _patch_page_request(req: MagicMock):
     """Temporarily replace ``page_api.request`` with *req*."""
     import astrbot_plugin_livingmemory.core.page_api as mod
+    import astrbot_plugin_livingmemory.core.page_api_modules.graph_handler as graph_mod
+    import astrbot_plugin_livingmemory.core.page_api_modules.memory_handler as memory_mod
+    import astrbot_plugin_livingmemory.core.page_api_modules.recall_handler as recall_mod
 
-    ns = vars(mod)
-    old = ns.get("request")
-    ns["request"] = req
+    # Patch all modules that use request
+    modules = [mod, memory_mod, recall_mod, graph_mod]
+    old_values = []
+
+    for module in modules:
+        ns = vars(module)
+        old_values.append((ns, ns.get("request")))
+        ns["request"] = req
+
     try:
         yield
     finally:
-        if old is not None:
-            ns["request"] = old
-        else:
-            ns.pop("request", None)
+        for ns, old in old_values:
+            if old is not None:
+                ns["request"] = old
+            else:
+                ns.pop("request", None)
 
 
 # Alias for brevity in tests
@@ -153,26 +161,61 @@ def _qp(req=None, **kw):
 
 class TestResponseHelpers:
     def test_ok_returns_status_format(self):
-        result = PluginPageApi._ok({"items": [1, 2]})
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
+        result = utils.ok({"items": [1, 2]})
         assert result == {"status": "ok", "data": {"items": [1, 2]}}
 
     def test_ok_defaults_to_none_data(self):
-        result = PluginPageApi._ok()
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
+        result = utils.ok()
         assert result == {"status": "ok", "data": None}
 
     def test_error_returns_status_format(self):
-        result = PluginPageApi._error("something went wrong")
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
+        result = utils.error("something went wrong")
         assert result == {"status": "error", "message": "something went wrong"}
 
     def test_error_converts_non_string(self):
-        result = PluginPageApi._error(ValueError("boom"))
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
+        result = utils.error(ValueError("boom"))
         assert result["status"] == "error"
         assert "boom" in result["message"]
 
 
 class TestNumberHelpers:
     def test_importance_to_display_handles_non_numeric_values(self):
-        assert PluginPageApi._importance_to_display("default") == 5.0
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
+        assert utils.importance_to_display("default") == 5.0
+
+
+class TestOptionalText:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (None, None),
+            ("", None),
+            ("   ", None),
+            ("None", None),
+            ("null", None),
+            ("undefined", None),
+            (" s1 ", "s1"),
+        ],
+    )
+    def test_optional_filter_values(self, raw, expected):
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
+        assert utils.optional_text(raw) == expected
 
 
 class TestNormalizeMetadata:
@@ -189,43 +232,67 @@ class TestNormalizeMetadata:
         ],
     )
     def test_normalize_metadata(self, raw, expected):
-        assert PluginPageApi._normalize_metadata(raw) == expected
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
+        assert utils.normalize_metadata(raw) == expected
 
 
 class TestTokenizeGraphQuery:
     def test_empty_query(self):
-        assert PluginPageApi._tokenize_graph_query("") == []
-        assert PluginPageApi._tokenize_graph_query("   ") == []
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
+        assert utils.tokenize_graph_query("") == []
+        assert utils.tokenize_graph_query("   ") == []
 
     def test_english_query(self):
-        tokens = PluginPageApi._tokenize_graph_query("machine learning")
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
+        tokens = utils.tokenize_graph_query("machine learning")
         assert "machine" in tokens
         assert "learning" in tokens
 
     def test_chinese_query(self):
-        tokens = PluginPageApi._tokenize_graph_query("人工智能发展")
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
+        tokens = utils.tokenize_graph_query("人工智能发展")
         assert len(tokens) >= 1
 
     def test_short_tokens_filtered(self):
-        tokens = PluginPageApi._tokenize_graph_query("a b c d")
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
+        tokens = utils.tokenize_graph_query("a b c d")
         assert all(len(t) >= 2 for t in tokens)
 
     def test_caps_returns_at_most_12(self):
-        tokens = PluginPageApi._tokenize_graph_query(
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
+        tokens = utils.tokenize_graph_query(
             "a b c d e f g h i j k l m n o p q r s t u v w x y z"
         )
         assert len(tokens) <= 12
 
     def test_mixed_chinese_english(self):
-        tokens = PluginPageApi._tokenize_graph_query("AI and 机器学习")
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
+        tokens = utils.tokenize_graph_query("AI and 机器学习")
         assert len(tokens) >= 1
 
 
 class TestBuildGraphViewPayload:
     def test_basic_structure(self):
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
         snapshot = {"nodes": [], "edges": [], "entries": [], "memories": []}
         stats = {"graph_nodes": 0, "graph_edges": 0, "graph_entries": 0}
-        result = PluginPageApi._build_graph_view_payload(
+        result = utils.build_graph_view_payload(
             snapshot,
             stats,
             enabled=True,
@@ -239,6 +306,9 @@ class TestBuildGraphViewPayload:
         assert "retrieval" in result
 
     def test_nodes_get_highlighted(self):
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
         snapshot = {
             "nodes": [
                 {"id": 1, "type": "topic", "weight": 0.8, "degree": 3, "label": "AI"}
@@ -248,7 +318,7 @@ class TestBuildGraphViewPayload:
             "memories": [],
         }
         stats = {"graph_nodes": 1, "graph_edges": 0, "graph_entries": 0}
-        result = PluginPageApi._build_graph_view_payload(
+        result = utils.build_graph_view_payload(
             snapshot,
             stats,
             enabled=True,
@@ -259,6 +329,9 @@ class TestBuildGraphViewPayload:
         assert result["snapshot"]["nodes"][0]["highlighted"] is True
 
     def test_top_nodes_sorted_by_weight(self):
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
         snapshot = {
             "nodes": [
                 {"id": 1, "type": "topic", "weight": 0.3, "degree": 1, "label": "B"},
@@ -269,7 +342,7 @@ class TestBuildGraphViewPayload:
             "memories": [],
         }
         stats = {"graph_nodes": 2, "graph_edges": 0, "graph_entries": 0}
-        result = PluginPageApi._build_graph_view_payload(
+        result = utils.build_graph_view_payload(
             snapshot,
             stats,
             enabled=True,
@@ -280,6 +353,9 @@ class TestBuildGraphViewPayload:
         assert top[0]["id"] == 2  # higher weight first
 
     def test_node_type_breakdown(self):
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
         snapshot = {
             "nodes": [
                 {"id": 1, "type": "topic"},
@@ -291,7 +367,7 @@ class TestBuildGraphViewPayload:
             "memories": [],
         }
         stats = {"graph_nodes": 3, "graph_edges": 0, "graph_entries": 0}
-        result = PluginPageApi._build_graph_view_payload(
+        result = utils.build_graph_view_payload(
             snapshot,
             stats,
             enabled=True,
@@ -303,6 +379,9 @@ class TestBuildGraphViewPayload:
         assert breakdown.get("person") == 1
 
     def test_non_numeric_weights_and_importance_do_not_break_sorting(self):
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
         snapshot = {
             "nodes": [
                 {"id": 1, "type": "topic", "weight": "auto", "degree": 1},
@@ -317,7 +396,7 @@ class TestBuildGraphViewPayload:
         }
         stats = {"graph_nodes": 2, "graph_edges": 0, "graph_entries": 0}
 
-        result = PluginPageApi._build_graph_view_payload(
+        result = utils.build_graph_view_payload(
             snapshot,
             stats,
             enabled=True,
@@ -331,14 +410,20 @@ class TestBuildGraphViewPayload:
 
 class TestGetGraphStore:
     def test_returns_graph_store_attribute(self):
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
         engine = FakeMemoryEngine()
         engine.graph_store = object()
-        assert PluginPageApi._get_graph_store(engine) is engine.graph_store
+        assert utils.get_graph_store(engine) is engine.graph_store
 
     def test_returns_none_when_no_graph_store(self):
+        from astrbot_plugin_livingmemory.core.page_api_modules import PageApiUtils
+
+        utils = PageApiUtils()
         engine = FakeMemoryEngine()
         engine.graph_store = None
-        assert PluginPageApi._get_graph_store(engine) is None
+        assert utils.get_graph_store(engine) is None
 
 
 # ---------------------------------------------------------------------------
@@ -420,7 +505,7 @@ class TestListMemories:
         )
         with _patch_page_request(req):
             with patch(
-                "astrbot_plugin_livingmemory.core.page_api.aiosqlite"
+                "astrbot_plugin_livingmemory.core.page_api_modules.memory_handler.aiosqlite"
             ) as mock_sqlite:
                 mock_conn = AsyncMock()
                 mock_conn.execute.return_value = mock_conn
@@ -433,6 +518,82 @@ class TestListMemories:
         assert result["status"] == "ok"
         assert result["data"]["total"] == 0
         assert result["data"]["items"] == []
+
+    @pytest.mark.asyncio
+    async def test_type_filter_and_sort_are_applied_in_sql(self, api, tmp_path):
+        db_path = tmp_path / "memories.db"
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute(
+                """
+                CREATE TABLE documents (
+                    id INTEGER PRIMARY KEY,
+                    doc_id TEXT,
+                    text TEXT,
+                    metadata TEXT,
+                    created_at TEXT,
+                    updated_at TEXT
+                )
+                """
+            )
+            rows = [
+                (
+                    1,
+                    "1",
+                    "low preference",
+                    {"memory_type": "PREFERENCE", "importance": 0.3, "create_time": 10},
+                ),
+                (
+                    2,
+                    "2",
+                    "high preference",
+                    {"memory_type": "PREFERENCE", "importance": 0.9, "create_time": 20},
+                ),
+                (
+                    3,
+                    "3",
+                    "other fact",
+                    {"memory_type": "FACT", "importance": 1.0, "create_time": 30},
+                ),
+            ]
+            for memory_id, doc_id, text, metadata in rows:
+                await db.execute(
+                    """
+                    INSERT INTO documents
+                        (id, doc_id, text, metadata, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        memory_id,
+                        doc_id,
+                        text,
+                        json.dumps(metadata),
+                        "created",
+                        "updated",
+                    ),
+                )
+            await db.commit()
+
+        api.plugin.initializer.memory_engine.db_path = str(db_path)
+        req = _mock_page_request(
+            args={
+                "page": "1",
+                "page_size": "20",
+                "session_id": "",
+                "keyword": "",
+                "status": "all",
+                "type": "PREFERENCE",
+                "sort": "importance_desc",
+            }
+        )
+
+        with _patch_page_request(req):
+            result = await api.list_memories()
+
+        assert result["status"] == "ok"
+        assert result["data"]["total"] == 2
+        assert result["data"]["filters"]["type"] == "PREFERENCE"
+        assert result["data"]["sort"] == "importance_desc"
+        assert [item["id"] for item in result["data"]["items"]] == [2, 1]
 
     @pytest.mark.asyncio
     async def test_plugin_not_ready(self, api_not_ready):
@@ -478,9 +639,8 @@ class TestUpdateMemory:
             }
         )
         with _patch_page_request(req):
-            with patch.object(
-                PluginPageApi,
-                "_get_memory_record",
+            with patch(
+                "astrbot_plugin_livingmemory.core.page_api_modules.memory_handler.MemoryHandler._get_memory_record",
                 return_value={"id": 1, "text": "hello", "metadata": {}},
             ):
                 result = await api.update_memory()
@@ -497,9 +657,8 @@ class TestUpdateMemory:
             }
         )
         with _patch_page_request(req):
-            with patch.object(
-                PluginPageApi,
-                "_get_memory_record",
+            with patch(
+                "astrbot_plugin_livingmemory.core.page_api_modules.memory_handler.MemoryHandler._get_memory_record",
                 return_value={"id": 1, "text": "hello", "metadata": {}},
             ):
                 result = await api.update_memory()
@@ -516,9 +675,8 @@ class TestUpdateMemory:
             }
         )
         with _patch_page_request(req):
-            with patch.object(
-                PluginPageApi,
-                "_get_memory_record",
+            with patch(
+                "astrbot_plugin_livingmemory.core.page_api_modules.memory_handler.MemoryHandler._get_memory_record",
                 return_value={"id": 1, "text": "hello", "metadata": {}},
             ):
                 result = await api.update_memory()
@@ -535,9 +693,8 @@ class TestUpdateMemory:
             }
         )
         with _patch_page_request(req):
-            with patch.object(
-                PluginPageApi,
-                "_get_memory_record",
+            with patch(
+                "astrbot_plugin_livingmemory.core.page_api_modules.memory_handler.MemoryHandler._get_memory_record",
                 return_value={"id": 1, "text": "hello", "metadata": {}},
             ):
                 result = await api.update_memory()
@@ -554,7 +711,10 @@ class TestUpdateMemory:
             }
         )
         with _patch_page_request(req):
-            with patch.object(PluginPageApi, "_get_memory_record", return_value=None):
+            with patch(
+                "astrbot_plugin_livingmemory.core.page_api_modules.memory_handler.MemoryHandler._get_memory_record",
+                return_value=None,
+            ):
                 result = await api.update_memory()
         assert result["status"] == "error"
         assert "不存在" in result["message"]
@@ -574,7 +734,10 @@ class TestUpdateMemory:
                 "text": "hello",
                 "metadata": {"session_id": "s1", "persona_id": "p1", "importance": 0.5},
             }
-            with patch.object(PluginPageApi, "_get_memory_record", return_value=memory):
+            with patch(
+                "astrbot_plugin_livingmemory.core.page_api_modules.memory_handler.MemoryHandler._get_memory_record",
+                return_value=memory,
+            ):
                 result = await api.update_memory()
         assert result["status"] == "error"
         assert "不能为空" in result["message"]
@@ -598,16 +761,22 @@ class TestUpdateMemory:
                     "importance": "default",
                 },
             }
-            with patch.object(PluginPageApi, "_get_memory_record", return_value=memory):
+            with patch(
+                "astrbot_plugin_livingmemory.core.page_api_modules.memory_handler.MemoryHandler._get_memory_record",
+                return_value=memory,
+            ):
                 api.plugin.initializer.memory_engine.add_memory = AsyncMock(
                     return_value=999
                 )
                 result = await api.update_memory()
 
         assert result["status"] == "ok"
-        assert api.plugin.initializer.memory_engine.add_memory.call_args.kwargs[
-            "importance"
-        ] == 0.5
+        assert (
+            api.plugin.initializer.memory_engine.add_memory.call_args.kwargs[
+                "importance"
+            ]
+            == 0.5
+        )
 
 
 class TestBatchDeleteMemories:
@@ -760,6 +929,100 @@ class TestGraphEndpoints:
         assert result["status"] == "ok"
         assert result["data"]["enabled"] is False
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("session_filter", [None, "None"])
+    async def test_query_expands_node_hits_without_text_recall(self, session_filter):
+        snapshot = {
+            "nodes": [
+                {
+                    "id": 56,
+                    "type": "person",
+                    "weight": 1.0,
+                    "degree": 0,
+                    "label": "luna",
+                }
+            ],
+            "edges": [],
+            "entries": [
+                {
+                    "id": 501,
+                    "memory_id": 123,
+                    "entry_type": "summary",
+                    "relation_type": "mentions",
+                    "content": "Luna appears in this memory",
+                    "metadata": {"session_id": "s1"},
+                    "node_ids": [56],
+                }
+            ],
+            "memories": [
+                {
+                    "memory_id": 123,
+                    "summary": "Luna appears in this memory",
+                    "importance": 0.7,
+                    "entry_count": 1,
+                    "node_count": 1,
+                    "edge_count": 0,
+                }
+            ],
+        }
+        graph_store = SimpleNamespace(
+            search_nodes_by_tokens=AsyncMock(
+                return_value=[
+                    {
+                        "id": 56,
+                        "node_key": "person:luna",
+                        "node_type": "person",
+                        "node_value": "luna",
+                        "canonical_value": "luna",
+                        "metadata": {},
+                    }
+                ]
+            ),
+            get_entries_for_node_ids=AsyncMock(
+                return_value=[
+                    {
+                        "entry_id": 501,
+                        "source_memory_id": 123,
+                        "content": "Luna appears in this memory",
+                        "metadata": {"session_id": "s1"},
+                        "score": 0.85,
+                    }
+                ]
+            ),
+            get_subgraph_for_memories=AsyncMock(return_value=snapshot),
+        )
+        engine = FakeMemoryEngine(graph_store=graph_store)
+        engine.search_memories = AsyncMock(return_value=[])
+        api = PluginPageApi(FakePlugin(memory_engine=engine))
+        req = _mock_page_request(
+            get_json={
+                "query": "luna",
+                "session_id": session_filter,
+                "persona_id": "undefined",
+            }
+        )
+
+        with _patch_page_request(req):
+            result = await api.query_graph()
+
+        assert result["status"] == "ok"
+        data = result["data"]
+        assert data["filters"]["session_id"] is None
+        assert data["filters"]["persona_id"] is None
+        assert data["matched_node_ids"] == [56]
+        assert data["matched_memory_ids"] == [123]
+        assert data["summary"]["visible_node_count"] == 1
+        assert data["snapshot"]["nodes"][0]["highlighted"] is True
+        assert data["retrieval"]["items"][0]["source"] == "graph_node"
+        engine.search_memories.assert_awaited_once()
+        assert engine.search_memories.call_args.kwargs["session_id"] is None
+        graph_store.get_entries_for_node_ids.assert_awaited_once()
+        assert (
+            graph_store.get_entries_for_node_ids.call_args.kwargs["session_id"] is None
+        )
+        graph_store.get_subgraph_for_memories.assert_awaited_once()
+        assert graph_store.get_subgraph_for_memories.call_args.args[0] == [123]
+
 
 class TestListBackups:
     @pytest.mark.asyncio
@@ -779,7 +1042,7 @@ class TestListBackups:
     @pytest.mark.asyncio
     async def test_with_backup_dir(self, api):
         with patch(
-            "astrbot_plugin_livingmemory.core.page_api.BackupManager.list_backups",
+            "astrbot_plugin_livingmemory.core.managers.backup_manager.BackupManager.list_backups",
             return_value=[],
         ):
             result = await api.list_backups()
@@ -823,11 +1086,11 @@ class TestEnsurePluginReady:
 
 
 class TestRouteRegistration:
-    def test_registers_all_page_routes(self):
+    def test_registers_all_ten_routes(self):
         plugin = FakePlugin()
         api = PluginPageApi(plugin)
         api.register_routes()
-        assert len(plugin._api_routes) == 15
+        assert len(plugin._api_routes) == 10
 
         paths = {route for route, _, _, _ in plugin._api_routes}
         prefix = PAGE_API_PREFIX
@@ -835,11 +1098,6 @@ class TestRouteRegistration:
         assert f"{prefix}/memories" in paths
         assert f"{prefix}/memories/update" in paths
         assert f"{prefix}/memories/batch-delete" in paths
-        assert f"{prefix}/import/documents" in paths
-        assert f"{prefix}/import/upload" in paths
-        assert f"{prefix}/import/jobs/start" in paths
-        assert f"{prefix}/import/jobs/status" in paths
-        assert f"{prefix}/export/memories" in paths
         assert f"{prefix}/recall/test" in paths
         assert f"{prefix}/graph/overview" in paths
         assert f"{prefix}/graph/query" in paths
@@ -847,371 +1105,3 @@ class TestRouteRegistration:
 
     def test_route_prefix_contains_plugin_name(self):
         assert PLUGIN_NAME in PAGE_API_PREFIX
-
-
-# ---------------------------------------------------------------------------
-# Document import
-# ---------------------------------------------------------------------------
-
-
-class TestDocumentImport:
-    @pytest.mark.asyncio
-    async def test_import_documents_requires_session(self, api, tmp_path):
-        document = tmp_path / "note.md"
-        document.write_text("# Note\n\nContent", encoding="utf-8")
-
-        req = _mock_page_request(get_json={"path": str(document), "session_id": ""})
-        with _qp(req):
-            result = await api.import_documents()
-
-        assert result["status"] == "error"
-        assert "session_id" in result["message"]
-
-    @pytest.mark.asyncio
-    async def test_import_documents_adds_document_chunks(self, tmp_path):
-        class CapturingMemoryEngine(FakeMemoryEngine):
-            def __init__(self):
-                super().__init__()
-                self.entries = []
-
-            async def add_memory(self, **kwargs):
-                self.entries.append(kwargs)
-                return len(self.entries)
-
-        memory_engine = CapturingMemoryEngine()
-        api = PluginPageApi(FakePlugin(memory_engine=memory_engine))
-        document = tmp_path / "note.md"
-        document.write_text("# Import Title\n\nImported content.", encoding="utf-8")
-
-        req = _mock_page_request(
-            get_json={
-                "path": str(document),
-                "session_id": "session-a",
-                "persona_id": "persona-a",
-                "importance": 8,
-            }
-        )
-        with _qp(req):
-            result = await api.import_documents()
-
-        assert result["status"] == "ok"
-        assert result["data"]["imported_count"] == 1
-        assert result["data"]["failed_count"] == 0
-        assert memory_engine.entries[0]["content"] == "# Import Title\n\nImported content."
-        assert memory_engine.entries[0]["session_id"] == "session-a"
-        assert memory_engine.entries[0]["persona_id"] == "persona-a"
-        assert memory_engine.entries[0]["importance"] == 0.8
-        assert memory_engine.entries[0]["metadata"]["memory_type"] == "DOCUMENT_IMPORT"
-        assert memory_engine.entries[0]["metadata"]["import_title"] == "Import Title"
-
-    @pytest.mark.asyncio
-    async def test_import_documents_restores_livingmemory_json_export(self, tmp_path):
-        class CapturingMemoryEngine(FakeMemoryEngine):
-            def __init__(self):
-                super().__init__()
-                self.entries = []
-
-            async def add_memory(self, **kwargs):
-                self.entries.append(kwargs)
-                return len(self.entries)
-
-        memory_engine = CapturingMemoryEngine()
-        api = PluginPageApi(FakePlugin(memory_engine=memory_engine))
-        export_file = tmp_path / "livingmemory-export.json"
-        export_file.write_text(
-            json.dumps(
-                {
-                    "items": [
-                        {
-                            "id": 9,
-                            "doc_id": "doc-9",
-                            "text": "Restored memory text.",
-                            "metadata": {
-                                "session_id": "old-session",
-                                "persona_id": "old-persona",
-                                "memory_type": "GENERAL",
-                                "canonical_summary": "Restored summary",
-                                "topics": ["saved"],
-                            },
-                        }
-                    ]
-                }
-            ),
-            encoding="utf-8",
-        )
-        req = _mock_page_request(
-            get_json={
-                "path": str(export_file),
-                "session_id": "new-session",
-                "persona_id": "new-persona",
-            }
-        )
-
-        with _qp(req):
-            result = await api.import_documents()
-
-        assert result["status"] == "ok"
-        assert result["data"]["imported_count"] == 1
-        entry = memory_engine.entries[0]
-        assert entry["content"] == "Restored memory text."
-        assert entry["session_id"] == "new-session"
-        assert entry["metadata"]["canonical_summary"] == "Restored summary"
-        assert entry["metadata"]["original_session_id"] == "old-session"
-        assert entry["metadata"]["original_persona_id"] == "old-persona"
-        assert entry["metadata"]["exported_memory_id"] == 9
-
-    @pytest.mark.asyncio
-    async def test_import_job_reports_progress_and_result(self, tmp_path):
-        class CapturingMemoryEngine(FakeMemoryEngine):
-            def __init__(self):
-                super().__init__()
-                self.entries = []
-
-            async def add_memory(self, **kwargs):
-                self.entries.append(kwargs)
-                return len(self.entries)
-
-        memory_engine = CapturingMemoryEngine()
-        api = PluginPageApi(FakePlugin(memory_engine=memory_engine))
-        document = tmp_path / "note.md"
-        document.write_text("# Job Import\n\nImported through job.", encoding="utf-8")
-
-        req = _mock_page_request(
-            get_json={
-                "mode": "documents",
-                "path": str(document),
-                "session_id": "session-job",
-            }
-        )
-        with _qp(req):
-            started = await api.start_import_job()
-
-        assert started["status"] == "ok"
-        job_id = started["data"]["job_id"]
-
-        for _ in range(20):
-            await asyncio.sleep(0.05)
-            req = _mock_page_request(args={"job_id": job_id})
-            with _qp(req):
-                status = await api.get_import_job_status()
-            if status["data"]["status"] == "completed":
-                break
-
-        assert status["status"] == "ok"
-        assert status["data"]["status"] == "completed"
-        assert status["data"]["percent"] == 100
-        assert status["data"]["result"]["imported_count"] == 1
-        assert memory_engine.entries[0]["session_id"] == "session-job"
-
-    @pytest.mark.asyncio
-    async def test_upload_job_rejects_too_many_files_without_partial_import(self):
-        class CapturingMemoryEngine(FakeMemoryEngine):
-            def __init__(self):
-                super().__init__()
-                self.entries = []
-
-            async def add_memory(self, **kwargs):
-                self.entries.append(kwargs)
-                return len(self.entries)
-
-        memory_engine = CapturingMemoryEngine()
-        api = PluginPageApi(FakePlugin(memory_engine=memory_engine))
-        req = _mock_page_request(
-            get_json={
-                "mode": "upload",
-                "files": [
-                    {"name": f"upload-{index}.md", "content": f"# File {index}"}
-                    for index in range(3)
-                ],
-                "session_id": "session-upload-limit",
-                "max_files": 2,
-            }
-        )
-        with _qp(req):
-            started = await api.start_import_job()
-
-        assert started["status"] == "ok"
-        job_id = started["data"]["job_id"]
-
-        for _ in range(20):
-            await asyncio.sleep(0.05)
-            req = _mock_page_request(args={"job_id": job_id})
-            with _qp(req):
-                status = await api.get_import_job_status()
-            if status["data"]["status"] == "failed":
-                break
-
-        assert status["status"] == "ok"
-        assert status["data"]["status"] == "failed"
-        assert "too many files" in status["data"]["error"]
-        assert memory_engine.entries == []
-
-    @pytest.mark.asyncio
-    async def test_import_documents_errors_when_all_chunks_fail(self, tmp_path):
-        class FailingMemoryEngine(FakeMemoryEngine):
-            async def add_memory(self, **kwargs):
-                raise RuntimeError("write failed")
-
-        api = PluginPageApi(FakePlugin(memory_engine=FailingMemoryEngine()))
-        document = tmp_path / "note.md"
-        document.write_text("# Import Title\n\nImported content.", encoding="utf-8")
-        req = _mock_page_request(
-            get_json={
-                "path": str(document),
-                "session_id": "session-a",
-            }
-        )
-
-        with _qp(req):
-            result = await api.import_documents()
-
-        assert result["status"] == "error"
-        assert "write failed" in result["message"]
-
-    @pytest.mark.asyncio
-    async def test_upload_documents_adds_uploaded_chunks(self):
-        class CapturingMemoryEngine(FakeMemoryEngine):
-            def __init__(self):
-                super().__init__()
-                self.entries = []
-
-            async def add_memory(self, **kwargs):
-                self.entries.append(kwargs)
-                return len(self.entries)
-
-        memory_engine = CapturingMemoryEngine()
-        api = PluginPageApi(FakePlugin(memory_engine=memory_engine))
-        req = _mock_page_request(
-            get_json={
-                "files": [{"name": "upload.md", "content": "# Uploaded\n\nBody"}],
-                "session_id": "session-b",
-                "importance": 6,
-            }
-        )
-        with _qp(req):
-            result = await api.upload_documents()
-
-        assert result["status"] == "ok"
-        assert result["data"]["imported_count"] == 1
-        assert memory_engine.entries[0]["content"] == "# Uploaded\n\nBody"
-        assert memory_engine.entries[0]["importance"] == 0.6
-        assert (
-            memory_engine.entries[0]["metadata"]["memory_origin"]
-            == "webui_document_upload"
-        )
-
-    @pytest.mark.asyncio
-    async def test_upload_documents_rejects_oversized_file(self):
-        api = PluginPageApi(FakePlugin())
-        req = _mock_page_request(
-            get_json={
-                "files": [
-                    {
-                        "name": "huge.md",
-                        "content": "x" * (MAX_UPLOAD_FILE_CHARS + 1),
-                    }
-                ],
-                "session_id": "session-b",
-            }
-        )
-
-        with _qp(req):
-            result = await api.upload_documents()
-
-        assert result["status"] == "error"
-        assert "上传文件过大" in result["message"]
-
-    @pytest.mark.asyncio
-    async def test_upload_documents_errors_when_all_chunks_fail(self):
-        class FailingMemoryEngine(FakeMemoryEngine):
-            async def add_memory(self, **kwargs):
-                raise RuntimeError("write failed")
-
-        api = PluginPageApi(FakePlugin(memory_engine=FailingMemoryEngine()))
-        req = _mock_page_request(
-            get_json={
-                "files": [{"name": "upload.md", "content": "# Uploaded\n\nBody"}],
-                "session_id": "session-b",
-            }
-        )
-
-        with _qp(req):
-            result = await api.upload_documents()
-
-        assert result["status"] == "error"
-        assert "write failed" in result["message"]
-
-
-class TestMemoryExport:
-    def _make_export_db(self, tmp_path):
-        db_path = tmp_path / "memories.sqlite"
-        conn = sqlite3.connect(db_path)
-        conn.execute(
-            """
-            CREATE TABLE documents (
-                id INTEGER PRIMARY KEY,
-                doc_id TEXT,
-                text TEXT,
-                metadata TEXT,
-                created_at TEXT,
-                updated_at TEXT
-            )
-            """
-        )
-        conn.execute(
-            "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                1,
-                "1",
-                "First exported memory",
-                json.dumps(
-                    {
-                        "session_id": "session-export",
-                        "status": "active",
-                        "importance": 0.7,
-                        "memory_type": "DOCUMENT_IMPORT",
-                        "canonical_summary": "Export title",
-                        "create_time": 100,
-                    }
-                ),
-                "created",
-                "updated",
-            ),
-        )
-        conn.commit()
-        conn.close()
-        return str(db_path)
-
-    @pytest.mark.asyncio
-    async def test_export_memories_json(self, tmp_path):
-        memory_engine = FakeMemoryEngine(db_path=self._make_export_db(tmp_path))
-        api = PluginPageApi(FakePlugin(memory_engine=memory_engine))
-        req = _mock_page_request(
-            get_json={"format": "json", "session_id": "session-export"}
-        )
-
-        with _qp(req):
-            result = await api.export_memories()
-
-        assert result["status"] == "ok"
-        assert result["data"]["count"] == 1
-        assert result["data"]["filename"].endswith(".json")
-        exported = json.loads(result["data"]["content"])
-        assert exported["items"][0]["text"] == "First exported memory"
-
-    @pytest.mark.asyncio
-    async def test_export_memories_markdown_for_selected_ids(self, tmp_path):
-        memory_engine = FakeMemoryEngine(db_path=self._make_export_db(tmp_path))
-        api = PluginPageApi(FakePlugin(memory_engine=memory_engine))
-        req = _mock_page_request(
-            get_json={"format": "markdown", "memory_ids": [1]}
-        )
-
-        with _qp(req):
-            result = await api.export_memories()
-
-        assert result["status"] == "ok"
-        assert result["data"]["count"] == 1
-        assert result["data"]["filename"].endswith(".md")
-        assert "## Export title" in result["data"]["content"]
-        assert "First exported memory" in result["data"]["content"]

@@ -7,6 +7,21 @@
 
 ## [Unreleased]
 
+## [2.3.5] - 2026-06-09
+
+### 重构
+- **EventHandler 模块化**: 将事件处理器拆分为 `GroupCapture`、`MemoryRecall`、`MemoryReflection` 三个子模块，提高代码可维护性 (#172)
+- **Page API 模块化**: 将 `page_api.py` 的处理逻辑提取到 `page_api_modules/` 目录下独立模块，职责分离更清晰 (#173)
+- **WebUI Dashboard 页面模块化**: 将前端页面逻辑拆分到 `modules/` 目录（memory-page.js、recall-page.js、graph-page.js、system-page.js）
+
+### 测试
+- 测试覆盖率从 73% 提升至 76% (#171)
+
+### 修复
+- **群聊全量捕获误唤醒 AstrBot**: 修复 `PassiveGroupCaptureFilter` 未正确屏蔽群消息导致触发 LLM 响应的问题 (#170)
+- **inspect-stack 崩溃**: 传递 `plugin_name` 给 `StarTools.get_data_dir()` 避免堆栈检查失败 (#169)
+- **WebUI Page API 过滤器规范化**: 统一前端 API 请求的参数处理逻辑
+
 ## [2.3.4] - 2026-06-02
 
 ### 修复
