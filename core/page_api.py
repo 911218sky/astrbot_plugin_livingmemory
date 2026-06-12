@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
+from dataclasses import replace
 from typing import Any
 
 import aiosqlite
@@ -99,6 +101,12 @@ class PluginPageApi:
             self.get_import_job_status,
             ["GET"],
             "LivingMemory Page import job status",
+        )
+        register(
+            f"{PAGE_API_PREFIX}/providers/llm",
+            self.list_llm_providers,
+            ["GET"],
+            "LivingMemory Page LLM providers",
         )
         register(
             f"{PAGE_API_PREFIX}/export/memories",
@@ -665,10 +673,10 @@ class PluginPageApi:
         try:
             importance = self._normalize_importance(payload.get("importance", 0.7))
             max_files = self._bounded_int(payload.get("max_files", 50), 1, 200)
-            max_chunks = self._bounded_int(payload.get("max_chunks", 200), 1, 1000)
-            chunk_size = self._bounded_int(payload.get("chunk_size", 3000), 500, 12000)
+            max_chunks = self._bounded_int(payload.get("max_chunks", 300), 1, 1000)
+            chunk_size = self._bounded_int(payload.get("chunk_size", 1800), 500, 12000)
             chunk_overlap = self._bounded_int(
-                payload.get("chunk_overlap", 300),
+                payload.get("chunk_overlap", 180),
                 0,
                 min(chunk_size - 1, 3000),
             )
@@ -760,10 +768,10 @@ class PluginPageApi:
         try:
             importance = self._normalize_importance(payload.get("importance", 0.7))
             max_files = self._bounded_int(payload.get("max_files", 50), 1, 200)
-            max_chunks = self._bounded_int(payload.get("max_chunks", 200), 1, 1000)
-            chunk_size = self._bounded_int(payload.get("chunk_size", 3000), 500, 12000)
+            max_chunks = self._bounded_int(payload.get("max_chunks", 300), 1, 1000)
+            chunk_size = self._bounded_int(payload.get("chunk_size", 1800), 500, 12000)
             chunk_overlap = self._bounded_int(
-                payload.get("chunk_overlap", 300),
+                payload.get("chunk_overlap", 180),
                 0,
                 min(chunk_size - 1, 3000),
             )
@@ -890,6 +898,38 @@ class PluginPageApi:
             return self._error("找不到匯入任務")
         return self._ok(self._public_import_job(job_id))
 
+    async def list_llm_providers(self):
+        """Return chat providers available to the plugin page."""
+        providers: list[dict[str, Any]] = []
+        try:
+            context = self.plugin.context
+            configured_id = self._get_default_llm_provider_id()
+            current_id = self._get_current_llm_provider_id()
+
+            seen: set[str] = set()
+            for index, provider in enumerate(self._iter_llm_providers(context)):
+                info = self._provider_public_info(provider, index=index)
+                provider_id = info.get("id")
+                if not provider_id or provider_id in seen:
+                    continue
+                info["configured"] = bool(
+                    configured_id and provider_id == configured_id
+                )
+                info["current"] = bool(current_id and provider_id == current_id)
+                providers.append(info)
+                seen.add(provider_id)
+
+            return self._ok(
+                {
+                    "providers": providers,
+                    "configured_provider_id": configured_id,
+                    "current_provider_id": current_id,
+                }
+            )
+        except Exception as exc:
+            logger.error(f"[PageAPI] 取得 LLM Provider 列表失敗: {exc}", exc_info=True)
+            return self._error(str(exc))
+
     def _public_import_job(self, job_id: str) -> dict[str, Any]:
         job = dict(self._import_jobs.get(job_id) or {})
         job.pop("task", None)
@@ -980,12 +1020,24 @@ class PluginPageApi:
         try:
             importance = self._normalize_importance(payload.get("importance", 0.7))
             max_files = self._bounded_int(payload.get("max_files", 50), 1, 200)
-            max_chunks = self._bounded_int(payload.get("max_chunks", 200), 1, 1000)
-            chunk_size = self._bounded_int(payload.get("chunk_size", 3000), 500, 12000)
+            max_chunks = self._bounded_int(payload.get("max_chunks", 300), 1, 1000)
+            chunk_size = self._bounded_int(payload.get("chunk_size", 1800), 500, 12000)
             chunk_overlap = self._bounded_int(
-                payload.get("chunk_overlap", 300),
+                payload.get("chunk_overlap", 180),
                 0,
                 min(chunk_size - 1, 3000),
+            )
+            index_concurrency = self._bounded_int(
+                payload.get("index_concurrency", 3),
+                1,
+                8,
+            )
+            ai_compress = bool(payload.get("ai_compress"))
+            ai_provider_id = str(payload.get("ai_provider_id", "") or "").strip()
+            ai_target_chars = self._bounded_int(
+                payload.get("ai_target_chars", 800),
+                200,
+                4000,
             )
         except (TypeError, ValueError) as exc:
             raise ValueError(str(exc)) from exc
@@ -1038,19 +1090,61 @@ class PluginPageApi:
             chunks = importer.load_text_documents(documents)
             origin = "webui_document_upload"
 
+        if ai_compress:
+            provider = self._get_llm_provider_for_import(ai_provider_id)
+            if not provider:
+                raise RuntimeError("AI 壓縮需要可用的 LLM Provider")
+            compressed_chunks = []
+            total_chunks = len(chunks)
+            self._update_import_job(
+                job_id,
+                phase="compressing",
+                message="正在使用 AI 壓縮文件內容",
+                current=0,
+                total=total_chunks,
+                percent=5,
+            )
+            for index, chunk in enumerate(chunks, start=1):
+                compressed_chunks.append(
+                    await self._compress_import_chunk(
+                        chunk,
+                        provider=provider,
+                        target_chars=ai_target_chars,
+                    )
+                )
+                self._update_import_job(
+                    job_id,
+                    phase="compressing",
+                    message=f"正在使用 AI 壓縮文件內容 ({index}/{total_chunks})",
+                    current=index,
+                    total=total_chunks,
+                )
+            chunks = compressed_chunks
+
         memory_ids: list[int] = []
         errors: list[dict[str, Any]] = []
         imported_at = time.time()
         total = len(chunks)
+        indexing_message = (
+            "AI 壓縮完成，正在產生 embedding 並寫入索引"
+            if ai_compress
+            else "正在產生 embedding 並寫入索引"
+        )
         self._update_import_job(
             job_id,
             phase="indexing",
-            message="正在產生 embedding 並寫入索引",
+            message=indexing_message,
+            ai_compress=ai_compress,
             current=0,
             total=total,
             percent=5,
         )
-        for index, chunk in enumerate(chunks, start=1):
+        completed = 0
+        progress_lock = asyncio.Lock()
+        result_slots: list[int | None] = [None] * total
+
+        async def index_chunk(index: int, chunk) -> None:
+            nonlocal completed
             metadata = self._build_document_import_metadata(
                 chunk,
                 session_id=session_id,
@@ -1067,28 +1161,53 @@ class PluginPageApi:
                     importance=importance,
                     metadata=metadata,
                 )
-                memory_ids.append(memory_id)
+                result_slots[index - 1] = memory_id
             except Exception as exc:
-                if len(errors) < 20:
-                    errors.append(
-                        {
-                            "source_path": chunk.source_path,
-                            "chunk_index": chunk.chunk_index,
-                            "message": str(exc),
-                        }
-                    )
+                async with progress_lock:
+                    if len(errors) < 20:
+                        errors.append(
+                            {
+                                "source_path": chunk.source_path,
+                                "chunk_index": chunk.chunk_index,
+                                "message": str(exc),
+                            }
+                        )
                 logger.error(
                     "[PageAPI] 文件 chunk 匯入失敗 "
                     f"({chunk.source_path} #{chunk.chunk_index}): {exc}",
                     exc_info=True,
                 )
-            self._update_import_job(
-                job_id,
-                phase="indexing",
-                message=f"正在產生 embedding 並寫入索引 ({index}/{total})",
-                current=index,
-                total=total,
+            finally:
+                async with progress_lock:
+                    completed += 1
+                    self._update_import_job(
+                        job_id,
+                        phase="indexing",
+                        message=f"{indexing_message} ({completed}/{total})",
+                        ai_compress=ai_compress,
+                        current=completed,
+                        total=total,
+                    )
+
+        if index_concurrency <= 1:
+            for index, chunk in enumerate(chunks, start=1):
+                await index_chunk(index, chunk)
+        else:
+            semaphore = asyncio.Semaphore(index_concurrency)
+
+            async def guarded_index_chunk(index: int, chunk) -> None:
+                async with semaphore:
+                    await index_chunk(index, chunk)
+
+            await asyncio.gather(
+                *[
+                    guarded_index_chunk(index, chunk)
+                    for index, chunk in enumerate(chunks, start=1)
+                ],
+                return_exceptions=False,
             )
+
+        memory_ids = [memory_id for memory_id in result_slots if memory_id is not None]
 
         if chunks and not memory_ids:
             message = errors[0]["message"] if errors else "所有文件片段写入失败"
@@ -1559,6 +1678,183 @@ class PluginPageApi:
         parsed = int(value)
         return max(minimum, min(maximum, parsed))
 
+    def _get_llm_provider_for_import(self, provider_id: str | None = None):
+        context = self.plugin.context
+        provider_id = str(provider_id or "").strip()
+        if provider_id:
+            try:
+                provider = context.get_provider_by_id(provider_id)
+                if provider:
+                    return provider
+            except Exception:
+                pass
+            provider_manager = getattr(context, "provider_manager", None)
+            inst_map = getattr(provider_manager, "inst_map", None)
+            if isinstance(inst_map, dict):
+                provider = inst_map.get(provider_id)
+                if provider:
+                    return provider
+            return None
+
+        configured_id = self._get_default_llm_provider_id()
+        if configured_id:
+            provider = self._get_llm_provider_for_import(configured_id)
+            if provider:
+                return provider
+
+        try:
+            return context.get_using_provider()
+        except Exception:
+            return None
+
+    def _get_default_llm_provider_id(self) -> str:
+        provider_manager = getattr(self.plugin.context, "provider_manager", None)
+        settings = getattr(provider_manager, "provider_settings", None) or {}
+        configured_id = str(settings.get("default_provider_id") or "").strip()
+        if configured_id:
+            return configured_id
+        try:
+            configured_id = str(
+                self.plugin.config_manager.get(
+                    "provider_settings.default_provider_id",
+                    "",
+                )
+                or self.plugin.config_manager.get(
+                    "provider_settings.llm_provider_id",
+                    "",
+                )
+                or ""
+            ).strip()
+        except Exception:
+            configured_id = ""
+        return configured_id
+
+    def _get_current_llm_provider_id(self) -> str:
+        try:
+            provider = self.plugin.context.get_using_provider()
+        except Exception:
+            provider = None
+        if not provider:
+            provider = getattr(
+                getattr(self.plugin.context, "provider_manager", None),
+                "curr_provider_inst",
+                None,
+            )
+        if not provider:
+            return ""
+        return self._provider_public_info(provider).get("id", "")
+
+    @staticmethod
+    def _iter_llm_providers(context) -> list[Any]:
+        candidates: list[Any] = []
+
+        def add_many(values) -> None:
+            if not values:
+                return
+            if isinstance(values, dict):
+                values = values.values()
+            for value in values:
+                if value and value not in candidates:
+                    candidates.append(value)
+
+        try:
+            add_many(context.get_all_providers())
+        except Exception:
+            pass
+
+        provider_manager = getattr(context, "provider_manager", None)
+        add_many(getattr(provider_manager, "provider_insts", None))
+
+        inst_map = getattr(provider_manager, "inst_map", None)
+        if isinstance(inst_map, dict):
+            add_many(inst_map.values())
+
+        return [
+            provider
+            for provider in candidates
+            if callable(getattr(provider, "text_chat", None))
+        ]
+
+    @staticmethod
+    def _provider_public_info(provider, *, index: int = 0) -> dict[str, Any]:
+        config = getattr(provider, "provider_config", {}) or {}
+        if not isinstance(config, dict):
+            config = getattr(config, "__dict__", {}) or {}
+        meta = None
+        try:
+            if hasattr(provider, "meta"):
+                meta = provider.meta()
+        except Exception:
+            meta = None
+        provider_id = str(
+            config.get("id")
+            or getattr(meta, "id", "")
+            or getattr(provider, "id", "")
+            or getattr(provider, "provider_id", "")
+            or f"provider_{index}"
+        )
+        name = str(
+            config.get("name")
+            or config.get("type")
+            or getattr(meta, "type", "")
+            or provider_id
+        )
+        model = ""
+        try:
+            if hasattr(provider, "get_model"):
+                model = str(provider.get_model() or "")
+        except Exception:
+            model = ""
+        if not model:
+            model = str(
+                getattr(meta, "model", "")
+                or config.get("model")
+                or config.get("model_name")
+                or ""
+            )
+        return {
+            "id": provider_id,
+            "name": name,
+            "model": model,
+            "type": str(config.get("type") or getattr(meta, "type", "") or ""),
+        }
+
+    async def _compress_import_chunk(
+        self,
+        chunk,
+        *,
+        provider,
+        target_chars: int,
+    ):
+        source_text = chunk.content.strip()
+        if not source_text:
+            return chunk
+        system_prompt = (
+            "你是文件匯入壓縮器。請保留可用於長期記憶檢索的核心資訊，"
+            "刪除寒暄、重複與低價值細節。只輸出壓縮後內容，不要解釋。"
+        )
+        prompt = (
+            f"來源標題：{chunk.title}\n"
+            f"目標長度：約 {target_chars} 字以內。\n"
+            "請用繁體中文或原文主要語言整理成清楚摘要，保留人名、時間、地點、任務、結論、偏好、重要數字與待辦。\n\n"
+            f"原文：\n{source_text}"
+        )
+        response = await provider.text_chat(prompt=prompt, system_prompt=system_prompt)
+        compressed = str(getattr(response, "completion_text", "") or "").strip()
+        compressed = re.sub(r"^```(?:\w+)?\s*|\s*```$", "", compressed).strip()
+        if not compressed:
+            raise RuntimeError("AI 壓縮回傳空內容")
+        metadata = dict(getattr(chunk, "metadata", None) or {})
+        metadata.update(
+            {
+                "ai_compressed": True,
+                "ai_compress_target_chars": target_chars,
+                "original_char_count": len(source_text),
+                "compressed_char_count": len(compressed),
+            }
+        )
+        return replace(chunk, content=compressed, metadata=metadata)
+
     @staticmethod
     def _build_document_import_metadata(
         chunk,
@@ -1609,6 +1905,17 @@ class PluginPageApi:
             metadata["exported_doc_id"] = source_metadata.get("exported_doc_id")
             metadata["exported_created_at"] = source_metadata.get("exported_created_at")
             metadata["exported_updated_at"] = source_metadata.get("exported_updated_at")
+        if source_metadata.get("ai_compressed"):
+            metadata["import_ai_compressed"] = True
+            metadata["ai_compress_target_chars"] = source_metadata.get(
+                "ai_compress_target_chars"
+            )
+            metadata["original_char_count"] = source_metadata.get(
+                "original_char_count"
+            )
+            metadata["compressed_char_count"] = source_metadata.get(
+                "compressed_char_count"
+            )
         return metadata
 
     async def _query_export_memories(

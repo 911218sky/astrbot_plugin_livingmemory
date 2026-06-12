@@ -118,7 +118,6 @@
             <div class="import-panel">
               <div class="import-panel-title" data-i18n="import.title">Document Import</div>
               <div class="import-form">
-                <input type="text" id="import-path" class="input" data-i18n-placeholder="import.pathPh" placeholder="/path/to/notes or /path/to/file.md" />
                 <label class="file-input-btn btn btn-secondary btn-sm">
                   <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>
                   <span data-i18n="import.chooseFiles">Choose Files</span>
@@ -133,15 +132,52 @@
                   <input type="range" id="import-importance" min="0" max="10" step="0.5" value="7" />
                   <span id="import-importance-value">7.0</span>
                 </label>
-                <button class="btn btn-primary btn-sm" id="import-documents-btn">
-                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5"/><path d="M12 3v12"/></svg>
-                  <span data-i18n="import.button">Import</span>
-                </button>
-                <button class="btn btn-secondary btn-sm" id="upload-documents-btn">
+                <div class="import-chunk-settings" aria-label="Import chunk settings">
+                  <label class="import-number-field">
+                    <span data-i18n="import.chunkSize">Chunk size</span>
+                    <input type="number" id="import-chunk-size" class="input input-sm" min="500" max="12000" step="100" value="1800" />
+                  </label>
+                  <label class="import-number-field">
+                    <span data-i18n="import.chunkOverlap">Overlap</span>
+                    <input type="number" id="import-chunk-overlap" class="input input-sm" min="0" max="3000" step="50" value="180" />
+                  </label>
+                  <label class="import-number-field">
+                    <span data-i18n="import.maxChunks">Max chunks</span>
+                    <input type="number" id="import-max-chunks" class="input input-sm" min="1" max="1000" step="10" value="300" />
+                  </label>
+                  <label class="import-number-field">
+                    <span data-i18n="import.indexConcurrency">Index concurrency</span>
+                    <input type="number" id="import-index-concurrency" class="input input-sm" min="1" max="8" step="1" value="3" />
+                  </label>
+                </div>
+                <div class="import-ai-compress">
+                  <label class="import-toggle">
+                    <input type="checkbox" id="import-ai-compress-enabled" />
+                    <span data-i18n="import.aiCompress">AI 壓縮</span>
+                  </label>
+                  <select id="import-ai-provider" class="select input input-sm" aria-label="AI compression provider" disabled>
+                    <option value="" data-i18n="import.aiProviderDefault">使用目前 LLM</option>
+                  </select>
+                  <label class="import-number-field">
+                    <span data-i18n="import.aiTargetChars">總結字數</span>
+                    <input type="number" id="import-ai-target-chars" class="input input-sm" min="200" max="4000" step="100" value="800" disabled />
+                  </label>
+                </div>
+                <button class="btn btn-primary btn-sm" id="upload-documents-btn">
                   <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="m17 8-5-5-5 5"/><path d="M5 21h14"/></svg>
                   <span data-i18n="import.uploadButton">Upload</span>
                 </button>
               </div>
+              <details class="import-advanced" id="import-advanced">
+                <summary data-i18n="import.advanced">Server path import</summary>
+                <div class="import-advanced-form">
+                  <input type="text" id="import-path" class="input" data-i18n-placeholder="import.pathPh" placeholder="/path/to/notes or /path/to/file.md" />
+                  <button class="btn btn-secondary btn-sm" id="import-documents-btn">
+                    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5"/><path d="M12 3v12"/></svg>
+                    <span data-i18n="import.button">Import</span>
+                  </button>
+                </div>
+              </details>
               <div class="import-progress hidden" id="import-progress" aria-live="polite">
                 <div class="import-progress-track">
                   <div class="import-progress-fill" id="import-progress-fill"></div>
@@ -150,6 +186,13 @@
                   <span id="import-progress-label" data-i18n="import.progressIdle">Ready</span>
                   <span id="import-progress-count">0%</span>
                 </div>
+              </div>
+              <div class="import-file-list hidden" id="import-file-list" aria-live="polite">
+                <div class="import-file-list-head">
+                  <span id="import-file-list-title" data-i18n="import.selectedTitle">Selected files</span>
+                  <button type="button" class="btn btn-ghost btn-sm" id="import-files-clear" data-i18n="common.clear">Clear</button>
+                </div>
+                <div class="import-file-items" id="import-file-items"></div>
               </div>
               <div class="import-hint" id="import-status" data-i18n="import.hint">Path is read from the AstrBot server/container filesystem. Supports .md, .markdown, .txt.</div>
             </div>

@@ -21,6 +21,7 @@
     selectedMemory: null,
     isEditing: false,
     importBusy: false,
+    importProviders: [],
     _detailCache: null,
     _nodeDetailCache: null,
     _recallCache: null,
@@ -295,6 +296,7 @@
   function refreshDynamicI18n() {
     if (state.page === "memory") {
       renderMemorySessionSelect();
+      renderSelectedUploadFiles();
       if (state.memory.items.length) renderMemoriesVirtual();
       else renderEmptyTable();
       updateMemoryPagination();
@@ -958,6 +960,11 @@
     });
     var fileInput = document.getElementById("import-files");
     if (fileInput) fileInput.disabled = state.importBusy;
+    ["import-chunk-size", "import-chunk-overlap", "import-max-chunks", "import-index-concurrency", "import-ai-compress-enabled", "import-ai-provider", "import-ai-target-chars"].forEach(function(id) {
+      var input = document.getElementById(id);
+      if (!input) return;
+      input.disabled = state.importBusy || (id !== "import-ai-compress-enabled" && id.indexOf("import-ai-") === 0 && !isImportAiCompressEnabled());
+    });
   }
 
   function ensureImportIdle() {
@@ -981,6 +988,79 @@
   function readImportImportance() {
     var importanceInput = document.getElementById("import-importance");
     return importanceInput ? parseFloat(importanceInput.value) : 7;
+  }
+
+  function clampNumberInput(id, fallback, min, max) {
+    var input = document.getElementById(id);
+    var value = input ? parseInt(input.value, 10) : fallback;
+    if (!Number.isFinite(value)) value = fallback;
+    value = Math.max(min, Math.min(max, value));
+    if (input) input.value = String(value);
+    return value;
+  }
+
+  function readImportChunkOptions() {
+    var chunkSize = clampNumberInput("import-chunk-size", 1800, 500, 12000);
+    var maxOverlap = Math.min(chunkSize - 1, 3000);
+    var chunkOverlap = clampNumberInput("import-chunk-overlap", 180, 0, maxOverlap);
+    var maxChunks = clampNumberInput("import-max-chunks", 300, 1, 1000);
+    var indexConcurrency = clampNumberInput("import-index-concurrency", 3, 1, 8);
+    return {
+      chunk_size: chunkSize,
+      chunk_overlap: chunkOverlap,
+      max_chunks: maxChunks,
+      index_concurrency: indexConcurrency,
+    };
+  }
+
+  function isImportAiCompressEnabled() {
+    var input = document.getElementById("import-ai-compress-enabled");
+    return !!(input && input.checked);
+  }
+
+  function readImportAiCompressionOptions() {
+    var enabled = isImportAiCompressEnabled();
+    var providerSelect = document.getElementById("import-ai-provider");
+    return {
+      ai_compress: enabled,
+      ai_provider_id: enabled && providerSelect ? providerSelect.value.trim() : "",
+      ai_target_chars: enabled ? clampNumberInput("import-ai-target-chars", 800, 200, 4000) : 800,
+    };
+  }
+
+  function renderImportProviders() {
+    var select = document.getElementById("import-ai-provider");
+    if (!select) return;
+    var current = select.value || "";
+    var options = ['<option value="">' + esc(window.t("import.aiProviderDefault")) + '</option>'];
+    state.importProviders.forEach(function(provider) {
+      var id = provider.id || "";
+      if (!id) return;
+      var label = provider.name || provider.model || id;
+      if (provider.model && provider.model !== label) label += " · " + provider.model;
+      options.push('<option value="' + esc(id) + '">' + esc(label) + '</option>');
+    });
+    select.innerHTML = options.join("");
+    select.value = current;
+  }
+
+  async function fetchImportProviders() {
+    try {
+      var data = unwrapApiData(await apiRequest("providers/llm")) || {};
+      state.importProviders = Array.isArray(data.providers) ? data.providers : [];
+      renderImportProviders();
+    } catch (_) {
+      state.importProviders = [];
+      renderImportProviders();
+    }
+  }
+
+  function updateImportAiControls() {
+    var enabled = isImportAiCompressEnabled();
+    ["import-ai-provider", "import-ai-target-chars"].forEach(function(id) {
+      var input = document.getElementById(id);
+      if (input) input.disabled = state.importBusy || !enabled;
+    });
   }
 
   function buildImportResultMessage(result, fallbackSessionId) {
@@ -1013,6 +1093,55 @@
   function clearSelectedUploadFiles() {
     var input = document.getElementById("import-files");
     if (input) input.value = "";
+    renderSelectedUploadFiles();
+  }
+
+  function getSelectedUploadFileSummary() {
+    var input = document.getElementById("import-files");
+    var files = input && input.files ? Array.prototype.slice.call(input.files) : [];
+    var supported = /\.(md|markdown|txt|json)$/i;
+    return files.map(function(file) {
+      var name = file.name || window.t("import.unnamedFile");
+      var ok = supported.test(name);
+      return {
+        name: name,
+        size: file.size || 0,
+        supported: ok,
+        label: ok ? window.t("import.fileReady") : window.t("import.fileUnsupported"),
+      };
+    });
+  }
+
+  function renderSelectedUploadFiles() {
+    var panel = document.getElementById("import-file-list");
+    var title = document.getElementById("import-file-list-title");
+    var items = document.getElementById("import-file-items");
+    if (!panel || !items) return;
+
+    var files = getSelectedUploadFileSummary();
+    panel.classList.toggle("hidden", !files.length);
+    if (!files.length) {
+      items.innerHTML = "";
+      if (title) title.textContent = window.t("import.selectedTitle");
+      return;
+    }
+
+    var supported = files.filter(function(file) { return file.supported; }).length;
+    var skipped = files.length - supported;
+    if (title) {
+      title.textContent = skipped
+        ? window.t("import.selectedTitleWithSkipped", supported, skipped)
+        : window.t("import.selectedTitleWithCount", supported);
+    }
+    items.innerHTML = files.map(function(file) {
+      var cls = file.supported ? "ready" : "unsupported";
+      return '<div class="import-file-item ' + cls + '">' +
+        '<span class="import-file-dot"></span>' +
+        '<span class="import-file-name" title="' + esc(file.name) + '">' + esc(file.name) + '</span>' +
+        '<span class="import-file-size">' + esc(formatBytes(file.size)) + '</span>' +
+        '<span class="import-file-state">' + esc(file.label) + '</span>' +
+        '</div>';
+    }).join("");
   }
 
   function setImportProgressVisible(visible) {
@@ -1037,6 +1166,10 @@
     var current = Number(job.current) || 0;
     var percent = Number(job.percent) || 0;
     var label = job.message || window.t("import.progressRunning");
+    if (job.phase === "indexing" && job.ai_compress && label.indexOf("AI") === -1) {
+      label = window.t("import.progressAiIndexing");
+      if (total > 0) label += " (" + current + "/" + total + ")";
+    }
     var countLabel = total > 0
       ? current + "/" + total + " · " + Math.round(percent) + "%"
       : Math.round(percent) + "%";
@@ -1101,6 +1234,8 @@
     var sessionId = readImportSessionId();
     var personaId = readImportPersonaId();
     var importance = readImportImportance();
+    var chunkOptions = readImportChunkOptions();
+    var aiOptions = readImportAiCompressionOptions();
 
     if (!importPath) return showToast(window.t("import.pathRequired"), true);
     if (!sessionId) return showToast(window.t("import.sessionRequired"), true);
@@ -1115,6 +1250,13 @@
           session_id: sessionId,
           persona_id: personaId || null,
           importance: importance,
+          chunk_size: chunkOptions.chunk_size,
+          chunk_overlap: chunkOptions.chunk_overlap,
+          max_chunks: chunkOptions.max_chunks,
+          index_concurrency: chunkOptions.index_concurrency,
+          ai_compress: aiOptions.ai_compress,
+          ai_provider_id: aiOptions.ai_provider_id,
+          ai_target_chars: aiOptions.ai_target_chars,
         }
       );
       var message = buildImportResultMessage(result, sessionId);
@@ -1166,6 +1308,8 @@
     var sessionId = readImportSessionId();
     var personaId = readImportPersonaId();
     var importance = readImportImportance();
+    var chunkOptions = readImportChunkOptions();
+    var aiOptions = readImportAiCompressionOptions();
 
     if (!sessionId) return showToast(window.t("import.sessionRequired"), true);
     setImportActionsDisabled(true);
@@ -1186,6 +1330,13 @@
           session_id: sessionId,
           persona_id: personaId || null,
           importance: importance,
+          chunk_size: chunkOptions.chunk_size,
+          chunk_overlap: chunkOptions.chunk_overlap,
+          max_chunks: chunkOptions.max_chunks,
+          index_concurrency: chunkOptions.index_concurrency,
+          ai_compress: aiOptions.ai_compress,
+          ai_provider_id: aiOptions.ai_provider_id,
+          ai_target_chars: aiOptions.ai_target_chars,
         }
       );
       var message = buildImportResultMessage(result, sessionId);
@@ -1497,6 +1648,13 @@
       importImportance.addEventListener("input", updateImportImportanceLabel);
     }
 
+    var aiCompress = document.getElementById("import-ai-compress-enabled");
+    if (aiCompress) {
+      aiCompress.addEventListener("change", updateImportAiControls);
+      updateImportAiControls();
+      fetchImportProviders();
+    }
+
     var importButton = document.getElementById("import-documents-btn");
     if (importButton) importButton.addEventListener("click", runDocumentImport);
 
@@ -1507,6 +1665,7 @@
     if (importFiles) {
       importFiles.addEventListener("change", function() {
         if (state.importBusy) return;
+        renderSelectedUploadFiles();
         var count = importFiles.files ? importFiles.files.length : 0;
         var supported = 0;
         if (importFiles.files) {
@@ -1519,6 +1678,14 @@
           ? window.t("import.filesSelectedWithSkipped", supported, skipped)
           : window.t("import.filesSelected", supported);
         setImportStatus(count ? message : window.t("import.hint"));
+      });
+    }
+    var clearImportFiles = document.getElementById("import-files-clear");
+    if (clearImportFiles) {
+      clearImportFiles.addEventListener("click", function() {
+        if (state.importBusy) return;
+        clearSelectedUploadFiles();
+        setImportStatus(window.t("import.hint"));
       });
     }
 

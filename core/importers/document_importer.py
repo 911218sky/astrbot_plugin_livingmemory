@@ -35,8 +35,8 @@ class DocumentImporter:
         *,
         max_files: int = 50,
         max_chunks: int = 200,
-        chunk_size: int = 3000,
-        chunk_overlap: int = 300,
+        chunk_size: int = 1800,
+        chunk_overlap: int = 180,
     ):
         if chunk_size < 500:
             raise ValueError("chunk_size must be at least 500")
