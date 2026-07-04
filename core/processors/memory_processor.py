@@ -208,6 +208,41 @@ class MemoryProcessor:
             )
             return base_prompt
 
+    @staticmethod
+    def _is_image_related_error(error: Exception) -> bool:
+        """Check if the error is related to image/vision/multimodal support."""
+        error_text = str(error).lower()
+        keywords = [
+            "image", "vision", "multimodal", "vlm", "图片",
+            "image_url", "not support", "unsupported",
+            "content type", "invalid content",
+        ]
+        return any(kw in error_text for kw in keywords)
+
+    def _strip_image_content(self, text: str) -> str:
+        """Aggressively strip all image-related content from text.
+
+        Used as a fallback when the LLM rejects the prompt due to
+        image/multimodal content that wasn't caught by normal sanitization.
+        """
+        # Remove lines that are primarily image markers
+        lines = text.split("\n")
+        cleaned_lines = []
+        for line in lines:
+            stripped = line.strip()
+            # Skip lines that are only image markers
+            if stripped in {"（发送了图片）", "[图片数据已省略]", "[图片]", "[图片消息]"}:
+                cleaned_lines.append("")
+                continue
+            # Remove image markers within lines
+            cleaned = re.sub(r"（发送了图片(?:，内容：[^）]*)?）", "", stripped)
+            cleaned = re.sub(r"\[图片(?:消息)?(?:\s*:\s*[^\]]*)?\]", "", cleaned)
+            cleaned = re.sub(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+", "", cleaned)
+            cleaned = re.sub(r'"image_url"\s*:\s*\{[^}]*\}', "", cleaned)
+            cleaned_lines.append(cleaned.strip())
+        result = "\n".join(line for line in cleaned_lines if line)
+        return result if result.strip() else "（对话中包含图片，已省略图片内容）"
+
     async def _call_llm_with_retry(
         self, prompt: str, system_prompt: str, max_retries: int = 3
     ) -> str:
@@ -223,17 +258,33 @@ class MemoryProcessor:
             LLM 响应文本
         """
         last_error = None
+        image_fallback_used = False
+        current_prompt = prompt
         for attempt in range(max_retries):
             try:
                 provider = self._get_current_llm_provider()
                 if not provider:
                     raise RuntimeError("LLM Provider 不可用")
                 response = await provider.text_chat(
-                    prompt=prompt, system_prompt=system_prompt
+                    prompt=current_prompt, system_prompt=system_prompt
                 )
                 return response.completion_text
             except Exception as e:
                 last_error = e
+
+                # Image error fallback: strip image content and retry once
+                if (
+                    not image_fallback_used
+                    and self._is_image_related_error(e)
+                ):
+                    logger.warning(
+                        f"[MemoryProcessor] 检测到图片相关错误，"
+                        f"已移除图片内容并重试: {e}"
+                    )
+                    current_prompt = self._strip_image_content(current_prompt)
+                    image_fallback_used = True
+                    continue
+
                 if attempt == max_retries - 1:
                     raise
                 wait_time = (2**attempt) + random.uniform(0, 1)
@@ -397,6 +448,41 @@ class MemoryProcessor:
             # 不再降级处理，直接向上抛出异常，由调用方处理重试逻辑
             raise
 
+    @staticmethod
+    def _sanitize_for_summarization(text: str) -> str:
+        """Remove or replace image/media markers that may confuse LLMs
+        during summarization, especially for text-only models.
+
+        Replaces:
+          - [图片消息] -> （发送了图片）
+          - [图片] -> （发送了图片）
+          - [图片: xxx] -> （发送了图片，内容：xxx）
+          - data:image/... base64 strings -> removed
+        """
+        if not text:
+            return text
+
+        # Replace image markers with natural language
+        text = re.sub(
+            r"\[图片:\s*(.*?)\]",
+            r"（发送了图片，内容：\1）",
+            text,
+        )
+        text = text.replace("[图片消息]", "（发送了图片）")
+        text = text.replace("[图片]", "（发送了图片）")
+
+        # Strip any stray base64 image data that might have leaked
+        text = re.sub(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+", "[图片数据已省略]", text)
+
+        # Strip any image_url JSON fragments that might have leaked
+        text = re.sub(
+            r'"image_url"\s*:\s*\{[^}]*\}',
+            "[图片数据已省略]",
+            text,
+        )
+
+        return text.strip()
+
     def _format_conversation(self, messages: list[Message]) -> str:
         """
         格式化对话历史为文本
@@ -428,7 +514,7 @@ class MemoryProcessor:
                 logger.debug(
                     f"[_format_conversation] 消息#{i} 格式化结果(私聊): {sender_info[:50]}..."
                 )
-        return "\n".join(formatted_lines)
+        return self._sanitize_for_summarization("\n".join(formatted_lines))
 
     @staticmethod
     def _format_sender_info(msg: Message) -> str:

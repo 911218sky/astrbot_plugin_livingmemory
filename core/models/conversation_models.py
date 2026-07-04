@@ -3,7 +3,9 @@
 包含 Message、Session、MemoryEvent 三个核心数据模型
 """
 
+import ast
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -46,6 +48,13 @@ class Message:
         if content is None:
             return ""
         if isinstance(content, str):
+            # If the string looks like a JSON/Python list (multimodal content
+            # that was serialized as a string), try to parse and normalize it.
+            stripped = content.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                parsed = Message._try_parse_content_list(stripped)
+                if parsed is not None:
+                    return parsed
             return content
         if isinstance(content, (int, float, bool)):
             return str(content)
@@ -66,6 +75,32 @@ class Message:
         if text:
             return text
         return "[图片消息]" if saw_media else str(content)
+
+    @staticmethod
+    def _try_parse_content_list(raw: str) -> str | None:
+        """Try to parse a string as a JSON/Python list and normalize it.
+
+        Returns normalized text on success, or None if the string is not
+        a recognizable list format.
+        """
+        # Try JSON first
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return Message.content_to_text(parsed)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Fall back to ast.literal_eval for Python-style repr strings
+        # (e.g. single-quoted dicts: [{'type': 'image_url', ...}])
+        try:
+            parsed = ast.literal_eval(raw)
+            if isinstance(parsed, list):
+                return Message.content_to_text(parsed)
+        except (ValueError, SyntaxError):
+            pass
+
+        return None
 
     @staticmethod
     def _content_part_to_text(part: Any) -> tuple[str, bool]:
